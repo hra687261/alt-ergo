@@ -771,24 +771,6 @@ let arg_repr env x a =
   then fst (X.make a), Explanation.empty
   else ra_ex
 
-(* [Some (a, n)] if [x] is [a ** n], with [n] an integer literal [>= 2]. *)
-let as_pow x =
-  match X.term_extract x with
-  | Some t, _ -> begin
-    match E.term_view t with
-    | { E.f = Sy.Op Sy.Pow; xs = [a; b]; _ } -> begin
-      let n =
-        match (E.term_view b).f with
-        | Sy.Int n -> Z.to_machine_int n
-        | Sy.Real q when Q.is_int q -> Z.to_machine_int (Q.to_z q)
-        | _ -> None
-      in
-      match n with Some n when n >= 2 -> Some (a, n) | _ -> None
-    end
-    | _ -> None
-  end
-  | None, _ -> None
-
 let rec init_monomes_of_poly are_eq env p use_p expl =
   List.fold_left
     (fun env (_, x) ->
@@ -865,25 +847,6 @@ and update_monome are_eq expl use_x env x =
             | Unknown -> ia, ib
           in
           I.div ia ib, env
-        | { E.f = Sy.Op Sy.Pow; _ } -> begin
-          match as_pow x with
-          | Some (a, n) ->
-            let ra, ea = arg_repr env x a in
-            let pa = poly_of ra in
-            let env, ia =
-              init_alien are_eq expl pa (P.normal_form_pos pa) use_x env
-            in
-            let bound_not_too_large get_bound =
-              match get_bound ia with
-              | b, _, _ -> not (Arith.power_too_large b n)
-              | exception I.No_finite_bound -> true
-            in
-            if
-              bound_not_too_large I.borne_inf && bound_not_too_large I.borne_sup
-            then I.power n (I.add_explanation ia ea), env
-            else I.undefined ty, env
-          | None -> I.undefined ty, env
-        end
         | _ -> I.undefined ty, env
         end
       | _ -> I.undefined ty, env)
@@ -944,35 +907,9 @@ let rec tighten_ac are_eq x env expl =
 
 and tighten_div _ env _ = env
 
-and tighten_pow are_eq x env expl =
-  let ty = X.type_info x in
-  match as_pow x with
-  | Some (a, 2) -> (
-    let ra, ea = arg_repr env x a in
-    if not (is_alien ra)
-    then env
-    else
-      try
-        let u, _ =
-          try MX.n_find x env.monomes
-          with Not_found -> I.undefined ty, SX.empty
-        in
-        let u = I.coerce ty (I.root 2 (I.coerce Treal u)) in
-        let u = I.add_explanation u ea in
-        let pu, use_pa =
-          try MX.n_find ra env.monomes
-          with Not_found -> I.undefined ty, SX.empty
-        in
-        let u = I.intersect u pu in
-        let env = MX.n_add ra (u, use_pa) pu env in
-        tighten_non_lin are_eq ra use_pa env expl
-      with Q.Not_a_float -> env)
-  | Some _ | None -> env
-
 and tighten_non_lin are_eq x use_x env expl =
   let env' = tighten_ac are_eq x env expl in
   let env' = tighten_div x env' expl in
-  let env' = tighten_pow are_eq x env' expl in
   (*let use_x = SX.union use1_x use2_x in*)
   (* let i, _ = MX.find x env.monomes in *)
   (*let env' = update_monome are_eq expl use_x env' x in too expensive*)
@@ -1941,11 +1878,11 @@ let round_to_integers list =
       x, if Q.compare (Q.sub q1 f) (Q.sub c q1) > 0 then f else c)
     (List.rev list)
 
-(* Products and literal powers computed from their base by [delayed_pow]. *)
+(* Products and literal powers (which are rewritten into products). *)
 let is_product_or_power r =
   match X.ac_extract r with
   | Some { Sig.h = Sy.Op Sy.Mult; _ } -> true
-  | _ -> Option.is_some (as_pow r)
+  | _ -> false
 
 (* cannot replace directly with env.int_sim because of encoding *)
 let model_from_simplex sim is_int env uf =
