@@ -60,6 +60,16 @@ let calc_power (c : Q.t) (d : Q.t) (ty : Ty.t) =
 let calc_power_opt (c : Q.t) (d : Q.t) (ty : Ty.t) =
   try Some (calc_power c d ty) with Exit -> None
 
+(* [Some n] if [t] is an integer literal [n >= 2]. *)
+let literal_exponent t =
+  let n =
+    match (E.term_view t).f with
+    | Sy.Int n -> Z.to_machine_int n
+    | Sy.Real q when Q.is_int q -> Z.to_machine_int (Q.to_z q)
+    | _ -> None
+  in
+  match n with Some n when n >= 2 -> Some n | _ -> None
+
 module Type (X : Sig.X) : Polynome.T with type r = X.r = struct
   include Polynome.Make (struct
     include X
@@ -331,6 +341,24 @@ struct
         Q.from_int (Fpa_rounding.integer_log_2 q)
       in
       mk_partial_interpretation_1 aux_func coef p ty t x, ctx
+    | Sy.Op Sy.Pow, [x; y] when not (Options.get_no_nla ()) -> (
+      let px, ctx = mke Q.one (empty_polynome ty) x ctx in
+      match P.is_const px, literal_exponent y with
+      | None, Some n ->
+        let m =
+          X.ac_embed
+            { h = Sy.Op Sy.Mult;
+              l = [is_mine px, n];
+              t = ty;
+              distribute = true
+            }
+        in
+        P.add p (P.create [coef, m] Q.zero ty), ctx
+      | _ ->
+        ( mk_partial_interpretation_2
+            (fun x y -> calc_power x y ty)
+            coef p ty t x y,
+          ctx ))
     | Sy.Op Sy.Pow, [x; y] ->
       ( mk_partial_interpretation_2
           (fun x y -> calc_power x y ty)
