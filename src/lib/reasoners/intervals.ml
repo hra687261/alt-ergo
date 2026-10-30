@@ -602,6 +602,13 @@ module QAlgebraicType = struct
         in
         Finite (k, m))
 
+  (* [float(prec, exp, mode, b)], which bounds [float(prec, exp, mode, x)] when
+     [b] bounds [x], as rounding is weakly increasing. *)
+  let float_round ~prec ~exp mode b =
+    match b with
+    | Neg_infinite | Pos_infinite -> b
+    | Finite (_, v) -> Finite (Eq, Fpa_rounding.round prec exp mode v)
+
   let ( + ) = add
 
   let ( * ) = mul
@@ -626,6 +633,10 @@ module Real = struct
          (QAlgebraicType.float_preimage_lb ~prec ~exp mode)
          (QAlgebraicType.float_preimage_ub ~prec ~exp mode)
          u
+
+  let float_image ~prec ~exp mode u =
+    let f = QAlgebraicType.float_round ~prec ~exp mode in
+    of_set_nonempty @@ approx_map_inc_to_set f f u
 end
 
 module Int = struct
@@ -877,6 +888,10 @@ module Legacy = struct
   let float_preimage ~prec ~exp mode = function
     | Real u -> of_real @@ check @@ Real.float_preimage ~prec ~exp mode u
     | Int _ -> invalid_arg "float_preimage"
+
+  let float_image ~prec ~exp mode = function
+    | Real u -> of_real @@ Real.float_image ~prec ~exp mode u
+    | Int _ -> invalid_arg "float_image"
 
   let add = map2 "add" Real.add Int.add
 

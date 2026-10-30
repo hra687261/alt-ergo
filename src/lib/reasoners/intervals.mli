@@ -56,6 +56,10 @@ module Real : sig
     (t, Explanation.t) kind
   (** [float_preimage ~prec ~exp mode u] is the set of the [x] such that
       [float(prec, exp, mode, x)] is in [u]. *)
+
+  val float_image : prec:int -> exp:int -> Fpa_rounding.rounding_mode -> t -> t
+  (** [float_image ~prec ~exp mode u] contains the [float(prec, exp, mode, x)]
+      for the [x] in [u]. *)
 end
 
 (** Union-of-intervals over integers. *)
@@ -164,6 +168,11 @@ module Legacy : sig
   (** See {!Real.float_preimage}. The interval must be a real interval.
 
       @raise NotConsistent if the preimage is empty.
+      @raise Invalid_argument if the interval is an integer interval. *)
+
+  val float_image : prec:int -> exp:int -> Fpa_rounding.rounding_mode -> t -> t
+  (** See {!Real.float_image}. The interval must be a real interval.
+
       @raise Invalid_argument if the interval is an integer interval. *)
 
   val add : t -> t -> t

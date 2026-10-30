@@ -82,6 +82,144 @@ let is_alien x =
   | Some (a, _, c) -> Q.equal a Q.one && Q.equal c Q.zero
   | _ -> false
 
+(* Normal form of arithmetic values for {!Domains}: the variable part of a
+   polynomial is an atom if it is a single variable with coefficient 1.
+   Constants carry their type, as integer and real intervals are distinct. *)
+module ArithNormalForm = struct
+  type constant = Q.t * Ty.t
+
+  module Atom = Rel_utils.XComparable
+
+  let type_info = X.type_info
+
+  module Composite = Rel_utils.XComparable
+
+  let fold_composite f r acc =
+    List.fold_left (fun acc (_, x) -> f x acc) acc (fst (P.to_list (poly_of r)))
+
+  type t =
+    | Constant of constant
+    | Atom of Atom.t * constant
+    | Composite of Composite.t * constant
+
+  let normal_form r =
+    let ty = X.type_info r in
+    let p, c = P.separate_constant (poly_of r) in
+    match P.to_list p with
+    | [], _ -> Constant (c, ty)
+    | [(a, x)], _ when Q.equal a Q.one -> Atom (x, (c, ty))
+    | _ -> Composite (alien_of p, (c, ty))
+end
+
+(* Interval domains of arithmetic values, used to propagate the [float]
+   terms. *)
+module Interval_domain = struct
+  type t = I.t
+
+  let equal = I.equal
+
+  let pp = I.print
+
+  exception Inconsistent of Ex.t
+
+  let filter_ty = function Ty.Tint | Treal -> true | _ -> false
+
+  type constant = Q.t * Ty.t
+
+  let constant (c, ty) = I.point c ty Ex.empty
+
+  let unknown = I.undefined
+
+  let add_explanation ~ex d = I.add_explanation d ex
+
+  let intersect d1 d2 =
+    try I.intersect d1 d2 with I.NotConsistent ex -> raise (Inconsistent ex)
+
+  let add_offset d c = I.add d (constant c)
+
+  let sub_offset d (c, ty) = I.add d (constant (Q.minus c, ty))
+
+  type var = X.r
+
+  type atom = X.r
+
+  let map_domain f r =
+    let l, c = P.to_list (poly_of r) in
+    List.fold_left
+      (fun d (a, x) -> I.add d (I.scale a (f x)))
+      (constant (c, X.type_info r))
+      l
+end
+
+(* A term [t = float(prec, exp, mode, x)], as the representatives of its
+   arguments ([i] instead of [x] if [x] is [real_of_int(i)]), and their
+   explanation. *)
+module Float_watch = struct
+  type t =
+    { t : X.r;
+      x : X.r;
+      prec : X.r;
+      exp : X.r;
+      mode : X.r;
+      ex : Ex.t
+    }
+
+  let pp ppf { t; x; prec; exp; mode; _ } =
+    Fmt.pf ppf "%a = float(%a, %a, %a, %a)" X.print t X.print prec X.print exp
+      X.print mode X.print x
+
+  let compare w1 w2 =
+    List.compare X.hash_cmp
+      [w1.t; w1.x; w1.prec; w1.exp; w1.mode]
+      [w2.t; w2.x; w2.prec; w2.exp; w2.mode]
+
+  module Set = Set.Make (struct
+    type nonrec t = t
+
+    let compare = compare
+  end)
+
+  module Map = Map.Make (struct
+    type nonrec t = t
+
+    let compare = compare
+  end)
+end
+
+module Float_domains = struct
+  (* Only the values related by a [float] term are tracked: the others are never
+     initialized, and their substitutions are ignored. *)
+  module D = Domains.Make (ArithNormalForm) (Interval_domain) (Float_watch)
+
+  type t =
+    { domains : D.t;
+      tracked : SX.t
+    }
+
+  let pp ppf t = D.pp ppf t.domains
+
+  type _ Uf.id += Id : t Uf.id
+
+  let empty = { domains = D.empty; tracked = SX.empty }
+
+  let filter_ty = Interval_domain.filter_ty
+
+  let init _ t = t
+
+  exception Inconsistent = Interval_domain.Inconsistent
+
+  let subst ~ex rr nrr t =
+    if SX.mem rr t.tracked
+    then
+      { domains = D.subst ~ex rr nrr t.domains;
+        tracked = SX.add nrr (SX.remove rr t.tracked)
+      }
+    else t
+
+  let watch w r t =
+    { domains = D.watch w r t.domains; tracked = SX.add r t.tracked }
+end
+
 module SimVar = struct
   type t = X.r
 
@@ -119,9 +257,11 @@ type t =
     new_uf : Uf.t;
     th_axioms : (Expr.th_elt * Explanation.t) ME.t;
     linear_dep : SE.t ME.t;
-    floats : (E.t * E.t * E.t * E.t) ME.t;
-    (* The terms [float(prec, exp, mode, x)], with their arguments ([i] instead
-       of [x] if [x] is [real_of_int(i)]). *)
+    floats : Float_watch.Set.t;
+    (* The [float] terms. *)
+    float_pending : Float_watch.Set.t;
+    (* The [float] terms whose parameters weren't known literals the last time
+       they were propagated. *)
     syntactic_matching :
       (Matching_types.trigger_info * Matching_types.gsubst list) list list
   }
@@ -709,10 +849,12 @@ let empty uf =
       int_sim = Sim.Solve.solve (Sim.Core.empty ~is_int:true ~check_invs:false);
       th_axioms = ME.empty;
       linear_dep = ME.empty;
-      floats = ME.empty;
+      floats = Float_watch.Set.empty;
+      float_pending = Float_watch.Set.empty;
       syntactic_matching = []
     },
-    Uf.domains uf )
+    Uf.GlobalDomains.add (module Float_domains) Float_domains.empty
+    @@ Uf.domains uf )
 
 (*let up_improved env p oldi newi = if I.is_strict_smaller newi oldi then { env
   with improved = SP.add p env.improved } else env*)
@@ -1510,32 +1652,42 @@ let interval_of env r =
     let i, _, _ = generic_find r env in
     i
 
-(* The term bounded from [float(prec, exp, mode, x)], and whether it is an
-   integer: [i] if [x] is [real_of_int(i)], so that its bounds are rounded,
-   otherwise [x] if it is an atom. *)
-let float_arg env x =
-  let rx, ex = Uf.find env.new_uf x in
-  match E.type_info x with
-  | Ty.Tint ->
-    if Option.is_some (P.is_const (poly_of rx)) then None else Some (rx, ex)
-  | _ -> if is_alien rx then Some (rx, ex) else None
-
-(* The values of the parameters of [float(prec, exp, mode, x)], with their
-   explanation, once they are known to be literals. *)
-let float_params env prec exp mode =
-  let int_param t =
-    let r, ex = Uf.find env.new_uf t in
+(* The values of the parameters of a [float] term, with their explanation, once
+   they are known to be literals. *)
+let float_params uf { Float_watch.prec; exp; mode; _ } =
+  let int_param r =
+    let r, ex = Uf.find_r uf r in
     match P.is_const (poly_of r) with
     | Some q when Q.is_int q ->
       Option.map (fun n -> n, ex) (Z.to_machine_int (Q.to_z q))
     | _ -> None
   in
-  let rm, ex_m = Uf.find env.new_uf mode in
+  let rm, ex_m = Uf.find_r uf mode in
   match int_param prec, int_param exp, X.to_model_term rm with
   | Some (prec, ex_p), Some (exp, ex_e), Some m ->
     let mode = E.rounding_mode_view m in
     Some (prec, exp, mode, Ex.union ex_p (Ex.union ex_e ex_m))
   | _ -> None
+
+(* Propagates [t = float(prec, exp, mode, x)] in both directions: [x] is in the
+   preimage of the domain of [t], and [t] in the image of the domain of [x].
+   Returns [false] if the parameters aren't known literals. *)
+let propagate_float uf dom (w : Float_watch.t) =
+  match float_params uf w with
+  | None -> false
+  | Some (prec, exp, mode, ex_p) ->
+    let open Float_domains.D.Ephemeral.Canon in
+    let dt = entry dom w.t and dx = entry dom w.x in
+    (* The explanation is added first, as an empty preimage is a conflict. *)
+    let ex = Ex.union w.ex ex_p in
+    update ~ex:Ex.empty dx
+      (I.add_explanation !!dt ex
+      |> I.float_preimage ~prec ~exp mode
+      |> I.coerce (X.type_info w.x));
+    update ~ex:Ex.empty dt
+      (I.add_explanation !!dx ex |> I.coerce Ty.Treal
+      |> I.float_image ~prec ~exp mode);
+    true
 
 (* Adds to [eqs] the lower (or upper) bound of [pre] on [rx], if it is tighter
    than the bound of [ix], the interval of [rx]. *)
@@ -1560,24 +1712,70 @@ let mk_bound ty rx ~ix ~pre is_lower eqs =
       let a = LR.mkv_builtin true (if large then L.LE else L.LT) args in
       (a, None, ex, Th_util.Other) :: eqs
 
-(* Bounds [x] by the preimage of the interval of [float(prec, exp, mode, x)]. *)
-let bounds_from_floats env eqs =
-  ME.fold
-    (fun t (prec, exp, mode, x) eqs ->
-      match float_params env prec exp mode, float_arg env x with
-      | Some (prec, exp, mode, ex_p), Some (rx, ex_x) ->
-        let rt, ex_t = Uf.find env.new_uf t in
-        let ty = E.type_info x in
-        let ex = Ex.union ex_p (Ex.union ex_t ex_x) in
-        let pre =
-          I.add_explanation (interval_of env rt) ex
-          |> I.float_preimage ~prec ~exp mode
-          |> I.coerce ty
-        in
-        let mk_bound = mk_bound ty rx ~ix:(interval_of env rx) ~pre in
-        mk_bound false (mk_bound true eqs)
-      | _ -> eqs)
-    env.floats eqs
+(* Whether bounds on [r] are added to the arithmetic: integers that aren't
+   known, and real atoms (bounds on sums slowed down some FPA queries). *)
+let bounded r =
+  match X.type_info r with
+  | Ty.Tint -> Option.is_none (P.is_const (poly_of r))
+  | _ -> is_alien r
+
+(* Propagates the [float] terms whose domains changed, or whose parameters
+   became literals, after importing the intervals of the arithmetic into the
+   domains. Adds to [eqs] the bounds on their arguments that are tighter than
+   those of the arithmetic, and the value of the [float] terms once it is known.
+   Other bounds on the [float] terms are not added: with them, model generation
+   picked ever larger values for both. *)
+let propagate_floats env uf fdom eqs =
+  let queue = Queue.create () in
+  let events =
+    { Domains_intf.evt_atomic_change = ignore;
+      evt_composite_change = ignore;
+      evt_watch_trigger = (fun w -> Queue.push w queue)
+    }
+  in
+  let dom = Float_domains.D.edit ~events fdom.Float_domains.domains in
+  Float_watch.Set.iter (fun w -> Queue.push w queue) env.float_pending;
+  let reprs w =
+    List.map (fun r -> fst (Uf.find_r uf r)) [w.Float_watch.t; w.x]
+  in
+  Float_watch.Set.iter
+    (fun w ->
+      List.iter
+        (fun r ->
+          Float_domains.D.Ephemeral.(update ~ex:Ex.empty (entry dom r))
+            (interval_of env r))
+        (reprs w))
+    env.floats;
+  let cdom = Float_domains.D.Ephemeral.canon uf dom in
+  let rec loop pending =
+    match Queue.take_opt queue with
+    | None -> pending
+    | Some w ->
+      if propagate_float uf cdom w
+      then loop (Float_watch.Set.remove w pending)
+      else loop (Float_watch.Set.add w pending)
+  in
+  let pending = loop env.float_pending in
+  let eqs, _ =
+    Float_watch.Set.fold
+      (fun w acc ->
+        List.fold_left
+          (fun ((eqs, seen) as acc) r ->
+            if SX.mem r seen || not (bounded r)
+            then acc
+            else
+              let pre = Float_domains.D.Ephemeral.(!!(entry dom r)) in
+              let ix = interval_of env r in
+              let mk_bound = mk_bound (X.type_info r) r ~ix ~pre in
+              mk_bound false (mk_bound true eqs), SX.add r seen)
+          acc
+          (let rt = fst (Uf.find_r uf w.t) in
+           let dt = Float_domains.D.Ephemeral.(!!(entry dom rt)) in
+           let rx = fst (Uf.find_r uf w.x) in
+           if Option.is_some (I.is_point dt) then [rx; rt] else [rx]))
+      env.floats (eqs, SX.empty)
+  in
+  eqs, { fdom with domains = Float_domains.D.snapshot dom }, pending
 
 let count_splits env la =
   let nb =
@@ -1734,7 +1932,7 @@ let assume ~query env uf la =
   try
     let env = if query then env else Sim_Wrap.solve env 1 in
     if !nb_num = 0 || query
-    then env, { Sig_rel.assume = []; remove = to_remove }
+    then env, Uf.domains uf, { Sig_rel.assume = []; remove = to_remove }
     else
       (* we only call fm when new ineqs are assumed *)
       let env, eqs =
@@ -1745,24 +1943,33 @@ let assume ~query env uf la =
       let env = Sim_Wrap.solve env 1 in
       let env = loop_update_intervals are_eq env 0 in
       let env, eqs = equalities_from_intervals env eqs in
-      let eqs = bounds_from_floats env eqs in
+      let ds = Uf.domains uf in
+      let fdom = Uf.GlobalDomains.find (module Float_domains) ds in
+      let eqs, fdom, float_pending =
+        if Float_watch.Set.is_empty env.floats
+        then eqs, fdom, env.float_pending
+        else propagate_floats env uf fdom eqs
+      in
+      let env = { env with float_pending } in
       Debug.env env;
       let to_assume = Rel_utils.assume_nontrivial_eqs eqs la in
       Debug.implied_equalities to_assume;
-      env, { Sig_rel.assume = to_assume; remove = to_remove }
-  with I.NotConsistent expl ->
+      ( env,
+        Uf.GlobalDomains.add (module Float_domains) fdom ds,
+        { Sig_rel.assume = to_assume; remove = to_remove } )
+  with I.NotConsistent expl | Interval_domain.Inconsistent expl ->
     Debug.inconsistent_interval expl;
     raise (Ex.Inconsistent (expl, env.classes))
 
 let assume ~query env uf la =
-  let env, res = assume ~query env uf la in
+  let env, ds, res = assume ~query env uf la in
   let polys =
     MP.fold
       (fun p _ mp ->
         if Uf.is_normalized uf (alien_of p) then mp else MP.remove p mp)
       env.polynomes env.polynomes
   in
-  { env with polynomes = polys }, Uf.domains uf, res
+  { env with polynomes = polys }, ds, res
 
 let query env uf a_ex =
   try
@@ -1859,7 +2066,8 @@ let add =
     Debug.env env;
     try
       let env = { env with new_uf } in
-      let env =
+      let ds = Uf.domains new_uf in
+      let env, ds =
         match E.term_view t with
         | { f = Sy.Op Sy.Float; xs = [prec; exp; mode; x]; _ } ->
           let x =
@@ -1867,8 +2075,20 @@ let add =
             | { f = Op Real_of_int; xs = [x]; _ } -> x
             | _ -> x
           in
-          { env with floats = ME.add t (prec, exp, mode, x) env.floats }
-        | _ -> env
+          let find t = Uf.find new_uf t in
+          let (rt, ex_t), (rx, ex_x) = find t, find x in
+          let (prec, ex_p), (exp, ex_e), (mode, ex_m) =
+            find prec, find exp, find mode
+          in
+          let ex = List.fold_left Ex.union ex_t [ex_x; ex_p; ex_e; ex_m] in
+          let w = { Float_watch.t = rt; x = rx; prec; exp; mode; ex } in
+          let fdom = Uf.GlobalDomains.find (module Float_domains) ds in
+          let fdom =
+            Float_domains.watch w rt @@ Float_domains.watch w rx fdom
+          in
+          ( { env with floats = Float_watch.Set.add w env.floats },
+            Uf.GlobalDomains.add (module Float_domains) fdom ds )
+        | _ -> env, ds
       in
       let p = poly_of r in
       Debug.add p;
@@ -1878,8 +2098,8 @@ let add =
           init_monomes_of_poly are_eq env p SX.empty Explanation.empty
         in
         let delayed, eqs = Rel_utils.Delayed.add env.delayed env.new_uf r t in
-        { env with delayed }, Uf.domains new_uf, eqs
-      else env, Uf.domains new_uf, []
+        { env with delayed }, ds, eqs
+      else env, ds, []
     with I.NotConsistent expl ->
       Debug.inconsistent_interval expl;
       raise (Ex.Inconsistent (expl, env.classes))
@@ -1991,6 +2211,17 @@ let model_from_simplex sim is_int env uf =
       else round_to_integers main_vars, round_to_integers slake_vars
     in
     let fct = if is_int then E.Ints.of_Q_exn else E.Reals.of_Q in
+    (* The value of a [float] term follows from the value of its argument.
+       Choosing both may be inconsistent, and the search then tries values of
+       the [float] term one by one. *)
+    let floats =
+      Float_watch.Set.fold
+        (fun w acc ->
+          if Option.is_some (float_params uf w)
+          then SX.add (fst (Uf.find_r uf w.t)) acc
+          else acc)
+        env.floats SX.empty
+    in
     List.fold_left
       (fun acc (v, q) ->
         assert ((not is_int) || Q.is_int q);
@@ -1998,6 +2229,8 @@ let model_from_simplex sim is_int env uf =
         then
           (* may happen because of incremental simplex on rationals *)
           acc
+        else if SX.mem v floats
+        then acc
         else
           let t = fct q in
           let r, _ = X.make t in
