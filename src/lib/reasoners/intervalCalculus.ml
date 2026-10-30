@@ -2013,10 +2013,16 @@ let round_to_integers list =
       x, if Q.compare (Q.sub q1 f) (Q.sub c q1) > 0 then f else c)
     (List.rev list)
 
-(* Products and literal powers (which are rewritten into products). *)
+(* Products and literal powers computed from their base by [delayed_pow]. *)
 let is_product_or_power r =
-  match X.ac_extract r with
-  | Some { Sig.h = Sy.Op Sy.Mult; _ } -> true
+  match X.ac_extract r, X.term_extract r with
+  | Some { Sig.h = Sy.Op Sy.Mult; _ }, _ -> true
+  | _, (Some t, _) -> begin
+    match E.term_view t with
+    | { f = Sy.Op Sy.Pow; xs = [_; b]; _ } ->
+      Option.is_some (Arith.literal_exponent b)
+    | _ -> false
+  end
   | _ -> false
 
 (* cannot replace directly with env.int_sim because of encoding *)
