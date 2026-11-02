@@ -494,10 +494,12 @@ let assume env uf la =
 
 let two = Numbers.Q.from_int 2
 
-(* Split on the most recent case split [k = i]. *)
+(* Split on the most recent case split [k = i] and try [k <> i] first: this
+   branch propagates the values. *)
 let case_split env _uf ~for_model:_ =
   match Util.MI.max_binding env.order with
   | _, lit ->
+    let lit = LX.neg lit in
     Log.debug (fun k -> k "case split@ %a" LX.print lit);
     [LX.view lit, true, Th_util.CS (Th_util.Th_arrays, two)]
   | exception Not_found -> []
