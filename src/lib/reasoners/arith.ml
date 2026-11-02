@@ -60,6 +60,16 @@ let calc_power (c : Q.t) (d : Q.t) (ty : Ty.t) =
 let calc_power_opt (c : Q.t) (d : Q.t) (ty : Ty.t) =
   try Some (calc_power c d ty) with Exit -> None
 
+(* [Some n] if [t] is an integer literal [n >= 2]. *)
+let literal_exponent t =
+  let n =
+    match (E.term_view t).f with
+    | Sy.Int n -> Z.to_machine_int n
+    | Sy.Real q when Q.is_int q -> Z.to_machine_int (Q.to_z q)
+    | _ -> None
+  in
+  match n with Some n when n >= 2 -> Some n | _ -> None
+
 module Type (X : Sig.X) : Polynome.T with type r = X.r = struct
   include Polynome.Make (struct
     include X
