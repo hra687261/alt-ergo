@@ -259,9 +259,14 @@ type t =
     (* The position of each case split in [order], to remove it. *)
     next_stamp : int;
     (* The position of the next case split in [order]. *)
-    new_terms : E.Set.t
-        (* Terms produced by the theory that are sent to the instantiation
-           engine. *)
+    new_terms : E.Set.t;
+    (* Terms produced by the theory that are sent to the instantiation
+       engine. *)
+    term_eqs : value list
+        (* Values [b[k] = v] deduced by the theory whose equality [(select b k)
+           = v] between terms has to be added to the congruence closure: the
+           instantiation engine matches modulo the classes of the terms (see
+           [term_eqs]). *)
   }
 
 let empty uf =
@@ -269,7 +274,8 @@ let empty uf =
       order = Util.MI.empty;
       stamps = LX.Map.empty;
       next_stamp = 0;
-      new_terms = E.Set.empty
+      new_terms = E.Set.empty;
+      term_eqs = []
     },
     (* The domain is only registered when the first select or store term is
        added: without arrays, the union-find does not update it. *)
@@ -318,27 +324,35 @@ let remove_split env lit =
       stamps = LX.Map.remove lit env.stamps
     }
 
-(* The term [(select b k)] is given to the instantiation engine. *)
+(* A term of the class of [r]. *)
+let term_of uf r =
+  match X.term_extract r with
+  | Some t, _ -> Some t
+  | None, _ -> E.Set.min_elt_opt (Uf.rclass_of uf r)
+
+(* Give the term [(select b k)] to the instantiation engine. *)
 let add_new_term uf env b k =
-  (* A term of the class of [r]. *)
-  let term r =
-    match X.term_extract r with
-    | Some t, _ -> Some t
-    | None, _ -> E.Set.min_elt_opt (Uf.rclass_of uf r)
-  in
-  match term b, term k with
+  match term_of uf b, term_of uf k with
   | Some b, Some k ->
     { env with new_terms = E.Set.add (E.ArraysEx.select b k) env.new_terms }
   | _ -> env
 
-(* Add the value [b[k] = v] and push it on [todo] if it is new. *)
-let add_value uf (env, dom, todo) b k v ex =
+(* Add the value [b[k] = v] and push it on [todo] if it is new. [term] is
+   [false] if the value comes from the term [(select b k)] itself, otherwise the
+   equality [(select b k) = v] between terms is added later (see [term_eqs]). *)
+let add_value ?(term = true) uf (env, dom, todo) b k v ex =
   let b, ex_b = Uf.find_r uf b in
   let k, ex_k = Uf.find_r uf k in
   let ex = Ex.union ex (Ex.union ex_b ex_k) in
   let dom, is_new = Domain.add_value b k (v, ex) dom in
   if is_new
-  then add_new_term uf env b k, dom, { a = b; k; v; ex } :: todo
+  then
+    let value = { a = b; k; v; ex } in
+    let env = add_new_term uf env b k in
+    let env =
+      if term then { env with term_eqs = value :: env.term_eqs } else env
+    in
+    env, dom, value :: todo
   else env, dom, todo
 
 (* Propagate the value [a[k] = v] through the edge [a --i-- b]. *)
@@ -468,10 +482,48 @@ let extensionality acc (a, _, dep, _) =
     aux acc l
   | _ -> acc
 
+(* A term of the class of [r], with the explanation of its membership. *)
+let term_ex_of uf r =
+  let r, ex_r = Uf.find_r uf r in
+  match term_of uf r with
+  | Some t -> Some (t, Ex.union ex_r (snd (Uf.find uf t)))
+  | None -> None
+
+(* Whether the class of [v] has a term [(select b' k')] with [b'] in the class
+   of [b] and [k'] in the class of [k]. *)
+let has_select uf b k v =
+  E.Set.exists
+    (fun t ->
+      match E.term_view t with
+      | { f = Op Select; xs = [b'; k']; _ } ->
+        same_class uf b (fst (Uf.find uf b'))
+        && same_class uf k (fst (Uf.find uf k'))
+      | _ -> false)
+    (Uf.rclass_of uf (fst (Uf.find_r uf v)))
+
+(* The equalities [(select b k) = v] between terms for the pending values,
+   unless the class of [v] already has such a term. The terms are chosen in the
+   current classes of [b], [k] and [v]. *)
+let term_eqs uf env =
+  List.fold_left
+    (fun l { a = b; k; v; ex } ->
+      if has_select uf b k v
+      then l
+      else
+        match term_ex_of uf b, term_ex_of uf k, term_ex_of uf v with
+        | Some (b, ex_b), Some (k, ex_k), Some (v, ex_v) ->
+          let ex = List.fold_left Ex.union ex [ex_b; ex_k; ex_v] in
+          let eq = E.mk_eq ~iff:false (E.ArraysEx.select b k) v in
+          (Literal.LTerm eq, ex, Th_util.Other) :: l
+        | _ -> l)
+    [] env.term_eqs
+
 let assume env uf la =
   let dom = get_domain uf in
   let env, domains, l =
-    if XMap.is_empty dom.values && LX.Map.is_empty env.splits
+    if
+      XMap.is_empty dom.values && LX.Map.is_empty env.splits
+      && Compat.List.is_empty env.term_eqs
     then
       (* No select or store terms: nothing to propagate. *)
       env, Uf.domains uf, []
@@ -487,7 +539,8 @@ let assume env uf la =
           (fun (v, w, ex) -> Literal.LSem (LX.mkv_eq v w), ex, Th_util.Other)
           eqs
       in
-      env, set_domain uf dom, l
+      let l = List.rev_append (term_eqs uf env) l in
+      { env with term_eqs = [] }, set_domain uf dom, l
   in
   let env, l = List.fold_left extensionality (env, l) la in
   env, domains, { Sig_rel.assume = l; remove = [] }
@@ -518,7 +571,7 @@ let add env uf r t =
       let ra, ex_a = Uf.find uf a in
       let ri, ex_i = Uf.find uf i in
       let ex = Ex.union ex_v (Ex.union ex_a ex_i) in
-      propagate uf (add_value uf (env, dom, []) ra ri v ex)
+      propagate uf (add_value ~term:false uf (env, dom, []) ra ri v ex)
     | Symbols.Op Store, [a; i; v] ->
       let s, ex_s = Uf.find_r uf r in
       let ra, ex_a = Uf.find uf a in
