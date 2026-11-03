@@ -52,6 +52,9 @@ val singleton : exp -> t
 
 val union : t -> t -> t
 
+val cardinal : t -> int
+(** Number of atoms in an explanation. *)
+
 val merge : t -> t -> t
 
 val iter_atoms : (exp -> unit) -> t -> unit

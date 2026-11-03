@@ -53,12 +53,22 @@ end)
 
 let timer = Timers.M_Adt
 
+module TMap = Map.Make (struct
+  type t = DE.term_cst
+
+  let compare id1 id2 = Nest.perfect_hash id1 - Nest.perfect_hash id2
+end)
+
 module Domain = struct
-  (* Set of possible constructors. The explanation justifies that any value
-     assigned to the semantic value has to use a constructor lying in the
-     domain. *)
+  (* Set of possible constructors. Each constructor that is not in the domain
+     comes with its own explanation and the explanation of the domain is the
+     union of the explanations of the excluded constructors.
+
+     Keeping them separate avoids blaming the conflicts on exclusions that do
+     not matter. *)
   type t =
     { constrs : TSet.t;
+      excl : Ex.t TMap.t;
       ex : Ex.t
     }
 
@@ -71,17 +81,19 @@ module Domain = struct
        generation. *)
     TSet.min_elt constrs
 
-  let[@inline always] as_singleton { constrs; ex } =
+  let[@inline always] as_singleton { constrs; ex; _ } =
     if TSet.cardinal constrs = 1 then Some (TSet.choose constrs, ex) else None
 
-  let domain ~constrs ex =
-    if TSet.is_empty constrs then raise @@ Inconsistent ex else { constrs; ex }
+  let ex_of_excl excl =
+    TMap.fold (fun _ ex acc -> Ex.union ex acc) excl Ex.empty
 
-  let[@inline always] singleton ~ex c = { constrs = TSet.singleton c; ex }
+  let make constrs excl =
+    let ex = ex_of_excl excl in
+    if TSet.is_empty constrs
+    then raise @@ Inconsistent ex
+    else { constrs; excl; ex }
 
-  let[@inline always] subset d1 d2 = TSet.subset d1.constrs d2.constrs
-
-  let unknown ty =
+  let all_constrs ty =
     match ty with
     | Ty.Tadt (name, params) ->
       (* Return the list of all the constructors of the type of [r]. *)
@@ -92,11 +104,27 @@ module Domain = struct
           TSet.empty cases
       in
       assert (not @@ TSet.is_empty constrs);
-      { constrs; ex = Ex.empty }
+      constrs
     | _ ->
       (* Only ADT values can have a domain. This case shouldn't happen since we
          check the type of semantic values in both [add] and [assume]. *)
       assert false
+
+  let unknown ty =
+    { constrs = all_constrs ty; excl = TMap.empty; ex = Ex.empty }
+
+  (* The domain [{c}]: [ex] justifies the exclusion of the other
+     constructors. *)
+  let singleton ty ~ex c =
+    let excl =
+      TSet.fold
+        (fun c' acc -> TMap.add c' ex acc)
+        (TSet.remove c (all_constrs ty))
+        TMap.empty
+    in
+    make (TSet.singleton c) excl
+
+  let[@inline always] subset d1 d2 = TSet.subset d1.constrs d2.constrs
 
   let equal d1 d2 = TSet.equal d1.constrs d2.constrs
 
@@ -105,15 +133,28 @@ module Domain = struct
     if Options.(get_verbose () || get_unsat_core ())
     then Fmt.pf ppf " %a" (Fmt.box Ex.print) d.ex
 
+  (* The smallest of two explanations of the same exclusion. *)
+  let smallest ex1 ex2 = if Ex.cardinal ex2 < Ex.cardinal ex1 then ex2 else ex1
+
+  (* [intersect ~ex d1 d2] where [ex] justifies the transfer of [d1] to the
+     class of [d2]: the exclusions of [d1] need [ex], those of [d2] do not. *)
   let intersect ~ex d1 d2 =
     let constrs = TSet.inter d1.constrs d2.constrs in
-    let ex = ex |> Ex.union d1.ex |> Ex.union d2.ex in
-    domain ~constrs ex
+    let excl =
+      TMap.fold
+        (fun c ex1 acc ->
+          let ex1 = Ex.union ex ex1 in
+          match TMap.find_opt c acc with
+          | Some ex2 -> TMap.add c (smallest ex2 ex1) acc
+          | None -> TMap.add c ex1 acc)
+        d1.excl d2.excl
+    in
+    make constrs excl
 
   let remove ~ex c d =
-    let constrs = TSet.remove c d.constrs in
-    let ex = Ex.union ex d.ex in
-    domain ~constrs ex
+    if not (TSet.mem c d.constrs)
+    then d
+    else make (TSet.remove c d.constrs) (TMap.add c ex d.excl)
 
   let for_all f { constrs; _ } = TSet.for_all f constrs
 end
@@ -175,7 +216,7 @@ module Domains = struct
     | Constr { c_name; _ } ->
       (* For sake of efficiency, we don't look in the map if the semantic value
          is a constructor. *)
-      Domain.singleton ~ex:Explanation.empty c_name
+      Domain.singleton (X.type_info r) ~ex:Explanation.empty c_name
     | _ -> (
       try MX.find r t.domains with Not_found -> Domain.unknown (X.type_info r))
 
@@ -348,8 +389,8 @@ let assume_distinct =
    an application of the constructor [c]. *)
 let assume_is_constr ~ex r c domains =
   let d1 = Domains.get r domains in
-  let d2 = Domain.singleton ~ex:Explanation.empty c in
-  let nd = Domain.intersect ~ex d1 d2 in
+  let d2 = Domain.singleton (X.type_info r) ~ex c in
+  let nd = Domain.intersect ~ex:Explanation.empty d2 d1 in
   Domains.tighten r nd domains
 
 (* Assume `(not ((_ is c) r))` where [r] can be a constructor application or a

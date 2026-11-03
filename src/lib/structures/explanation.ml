@@ -70,6 +70,8 @@ let empty = S.empty
 
 let union s1 s2 = if s1 == s2 then s1 else S.union s1 s2
 
+let cardinal = S.cardinal
+
 let singleton e = S.singleton e
 
 let mem e s = S.mem e s
