@@ -28,3 +28,9 @@
 include Sig_rel.RELATION
 
 val src : Logs.src
+
+val register_lemma : Expr.t -> unit
+(** [register_lemma f] is called by the instantiation engine for each quantified
+    formula [f] it is given. The [select] terms of the values deduced by the
+    theory are only added to the congruence closure once a formula containing a
+    [select] term is registered because its triggers may need them. *)

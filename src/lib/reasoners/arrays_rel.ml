@@ -49,6 +49,32 @@ module Log = (val Logs.src_log src : Logs.LOG)
 
 let timer = Timers.M_Arrays
 
+(* Whether [e] contains a [select] term, including under binders and in the
+   triggers of quantified formulas. *)
+let rec has_select e =
+  let { E.f; xs; bind; _ } = E.term_view e in
+  match f with
+  | Symbols.Op Select -> true
+  | _ -> (
+    List.exists has_select xs
+    ||
+    match bind with
+    | E.B_lemma q | E.B_skolem q ->
+      has_select q.E.main
+      || List.exists
+           (fun { E.content; hyp; _ } ->
+             List.exists has_select content || List.exists has_select hyp)
+           q.E.user_trs
+    | E.B_let { let_e; in_e; _ } -> has_select let_e || has_select in_e
+    | E.B_none -> false)
+
+(* The [select] terms of the values are needed by the instantiation engine (see
+   [register_lemma] and [term_eqs]). *)
+let needs_select_terms, register_lemma =
+  let needed = ref false in
+  ( (fun () -> !needed),
+    fun f -> if (not !needed) && has_select f then needed := true )
+
 type eq = X.r * X.r * Ex.t
 
 let add_loc k a locs =
@@ -523,7 +549,7 @@ let assume env uf la =
   let env, domains, l =
     if
       XMap.is_empty dom.values && LX.Map.is_empty env.splits
-      && Compat.List.is_empty env.term_eqs
+      && ((not (needs_select_terms ())) || Compat.List.is_empty env.term_eqs)
     then
       (* No select or store terms: nothing to propagate. *)
       env, Uf.domains uf, []
@@ -539,8 +565,14 @@ let assume env uf la =
           (fun (v, w, ex) -> Literal.LSem (LX.mkv_eq v w), ex, Th_util.Other)
           eqs
       in
-      let l = List.rev_append (term_eqs uf env) l in
-      { env with term_eqs = [] }, set_domain uf dom, l
+      if needs_select_terms ()
+      then
+        let l = List.rev_append (term_eqs uf env) l in
+        { env with term_eqs = [] }, set_domain uf dom, l
+      else
+        (* No quantified formula needs the terms of the values: they are kept
+           until one is added (see [register_lemma]). *)
+        env, set_domain uf dom, l
   in
   let env, l = List.fold_left extensionality (env, l) la in
   env, domains, { Sig_rel.assume = l; remove = [] }

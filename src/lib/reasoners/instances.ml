@@ -399,6 +399,7 @@ module Make (X : Theory.S) : S with type tbox = X.t = struct
     mround env env.predicates tbox selector ilvl "predicates" mconf tconf
 
   let add_lemma env gf dep =
+    Arrays_rel.register_lemma gf.Expr.ff;
     let guard = E.vrai in
     (* lemmas are already guarded outside instances.ml *)
     let { Expr.ff = orig; age; _ } = gf in
