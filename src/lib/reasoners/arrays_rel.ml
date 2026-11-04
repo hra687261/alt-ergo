@@ -38,10 +38,7 @@ module XSet = Shostak.SXH
 
    - known values: [a[i] = v], from [(select a i)] and [a = (store _ i v)]
 
-   - edges: [a --i-- b], from [b = (store a i _)] or [a = (store b i _)]
-
-   [a[k] = v] gives [b[k] = v] through [a --i-- b] if [k <> i], otherwise a case
-   split on [k = i]. Two values [a[k] = v] and [a[k] = w] give [v = w]. *)
+   - edges: [a --i-- b], from [b = (store a i _)] or [a = (store b i _)] *)
 
 let src = Logs.Src.create ~doc:"Arrays_rel" __MODULE__
 
@@ -250,15 +247,16 @@ type value =
     ex : Ex.t
   }
 
+(* The case splits are chosen by creation order, the most recent first (see
+   [case_split]). [order] is the list of the pending case splits, the most
+   recent first: a new case split is pushed on it ([add_split]), a decided one
+   is removed from it ([remove_split]) and [case_split] takes its head. A case
+   split that is added again keeps its position. *)
 type t =
   { splits : value list LX.Map.t;
     (* Map of the case splits [k = i] to the values to add if [k <> i]. *)
-    order : LX.t Util.MI.t;
-    (* The case splits by creation order. *)
-    stamps : int LX.Map.t;
-    (* The position of each case split in [order], to remove it. *)
-    next_stamp : int;
-    (* The position of the next case split in [order]. *)
+    order : LX.t list;
+    (* The case splits of [splits], the most recent first. *)
     new_terms : E.Set.t;
     (* Terms produced by the theory that are sent to the instantiation
        engine. *)
@@ -269,13 +267,7 @@ type t =
   }
 
 let empty uf =
-  ( { splits = LX.Map.empty;
-      order = Util.MI.empty;
-      stamps = LX.Map.empty;
-      next_stamp = 0;
-      new_terms = E.Set.empty;
-      term_eqs = []
-    },
+  ( { splits = LX.Map.empty; order = []; new_terms = E.Set.empty; term_eqs = [] },
     (* The domain is only registered when the first select or store term is
        added: without arrays, the union-find does not update it. *)
     Uf.domains uf )
@@ -297,7 +289,6 @@ let add_split env (dom : Domain.t) k i value =
   match LX.Map.find lit env.splits with
   | ps -> { env with splits = LX.Map.add lit (value :: ps) env.splits }, dom
   | exception Not_found ->
-    let n = env.next_stamp in
     let add_lit r locs =
       XMap.update r
         (function
@@ -307,21 +298,18 @@ let add_split env (dom : Domain.t) k i value =
     in
     ( { env with
         splits = LX.Map.add lit [value] env.splits;
-        order = Util.MI.add n lit env.order;
-        stamps = LX.Map.add lit n env.stamps;
-        next_stamp = n + 1
+        order = lit :: env.order
       },
       { dom with split_locs = add_lit k (add_lit i dom.split_locs) } )
 
 let remove_split env lit =
-  match LX.Map.find lit env.stamps with
-  | exception Not_found -> env
-  | n ->
+  if LX.Map.mem lit env.splits
+  then
     { env with
       splits = LX.Map.remove lit env.splits;
-      order = Util.MI.remove n env.order;
-      stamps = LX.Map.remove lit env.stamps
+      order = List.filter (fun l -> not (LX.equal l lit)) env.order
     }
+  else env
 
 (* A term of the class of [r]. *)
 let term_of uf r =
@@ -359,9 +347,8 @@ let add_value ?(from_select = false) uf (env, dom, todo) b k v ex =
     env, dom, value :: todo
   else env, dom, todo
 
-(* Propagate the value [a[k] = v] through the edge [a --i-- b]. *)
-(* For the edge [a --i-- b] and the value [a[i] = v]: if [b[i] = v] too,
-   then [a = b], since [a] and [b] agree on all the other indices. *)
+(* For the edge [a --i-- b] and the value [a[i] = v]: [a = b] if [b[i] = v] too,
+   since [a] and [b] agree on all the other indices. *)
 let check_edge uf (env, (dom : Domain.t), todo) { a; k = i; v; ex } b eex =
   let i, ex_i = Uf.find_r uf i in
   match XMap.find i (Domain.values_of b dom) with
@@ -375,6 +362,9 @@ let check_edge uf (env, (dom : Domain.t), todo) { a; k = i; v; ex } b eex =
       env, { dom with eqs = (a, b, ex) :: dom.eqs }, todo
     else env, dom, todo
 
+(* Propagate the value [a[k] = v] through the edge [a --i-- b]: add [b[k] = v]
+   if [k <> i], call [check_edge] if [k = i], otherwise create a case split on
+   [k = i]. *)
 let cross uf acc ({ k; v; ex; _ } as value) b i eex =
   if same_class uf k i
   then check_edge uf acc value b eex
@@ -561,12 +551,12 @@ let two = Numbers.Q.from_int 2
 (* Split on the most recent case split [k = i] and try [k <> i] first: this
    branch propagates the values. *)
 let case_split env _uf ~for_model:_ =
-  match Util.MI.max_binding env.order with
-  | _, lit ->
+  match env.order with
+  | lit :: _ ->
     let lit = LX.neg lit in
     Log.debug (fun k -> k "case split@ %a" LX.print lit);
     [LX.view lit, true, Th_util.CS (Th_util.Th_arrays, two)]
-  | exception Not_found -> []
+  | [] -> []
 
 let optimizing_objective _env _uf _o = None
 
