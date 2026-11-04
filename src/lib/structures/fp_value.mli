@@ -46,6 +46,12 @@ val mk_fp_literal :
     exponent width, and [sb] is the significand width (including the hidden
     bit). *)
 
+val to_bits : int -> int -> t -> (bool * int * Z.t) option
+(** [to_bits eb sb v] given a float [v] in the format [(eb, sb)], returns the
+    IEEE 754 fields [(sign, biased_exp, mantissa)], where [mantissa] excludes
+    the hidden bit. Returns [None] for [NaN], which has several representations.
+    This is the inverse of {!mk_fp_literal} for non-NaN values. *)
+
 val max_finite_q : int -> int -> Numbers.Q.t
 (** [max_finite_q eb sb] is the largest finite value of the format [(eb, sb)].
 *)
@@ -61,3 +67,13 @@ val is_normal : int -> t -> bool
 val is_subnormal : int -> t -> bool
 (** [is_subnormal eb v] holds if [v] is a subnormal value of a format with [eb]
     exponent bits. *)
+
+val of_q :
+  ?neg_zero:bool -> int -> int -> Fpa_rounding.rounding_mode -> Numbers.Q.t -> t
+(** [of_q eb sb mode q] rounds the rational [q] to the format [(eb, sb)] using
+    the rounding mode [mode]. Following IEEE 754, overflows produce either an
+    infinity or the largest finite value.
+
+    The result is a zero with the sign of [q] when a nonzero [q] underflows to
+    zero. When [q] is zero, the result is [Minus_zero] if [neg_zero] is [true]
+    (defaults to [false]) and [Plus_zero] otherwise. *)
