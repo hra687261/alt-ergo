@@ -238,6 +238,17 @@ module SmtPrinter = struct
       pp_rational ppf (Q.neg q)
     | Sy.Op Minus, [e1; e2] when is_zero e1.f ->
       Fmt.pf ppf "@[<2>(- %a@])" pp e2
+    (* The SMT-LIB conversions, without the [eb] and [sb] arguments. *)
+    | Sy.Op Float_to_fp, [_; _; mode; x] ->
+      let eb, sb =
+        match ty with Ty.Tfloat (eb, sb) -> eb, sb | _ -> assert false
+      in
+      Fmt.pf ppf "@[<2>((_ to_fp %d %d) %a %a@])" eb sb pp mode pp x
+    | ( Sy.Op ((Float_of_bits | Float_to_ubv _ | Float_to_sbv _) as op),
+        _ :: _ :: xs ) ->
+      Fmt.pf ppf "@[<2>(%a %a@])" Symbols.pp_smtlib_operator op
+        Fmt.(list ~sep:sp pp |> box)
+        xs
     | Sy.Op op, _ :: _ ->
       Fmt.pf ppf "@[<2>(%a %a@])" Symbols.pp_smtlib_operator op
         Fmt.(list ~sep:sp pp |> box)
