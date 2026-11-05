@@ -81,7 +81,10 @@ module Domain = struct
          [check_merged_values]). *)
       split_todo : LX.Set.t;
       (* Case splits whose indices have been merged with others. *)
-      eqs : eq list (* Deduced equalities that have not been propagated yet. *)
+      eqs : eq list;
+      (* Deduced equalities that have not been propagated yet. *)
+      neqs : eq list
+          (* Deduced disequalities that have not been propagated yet. *)
     }
 
   type _ Uf.id += Id : t Uf.id
@@ -97,7 +100,8 @@ module Domain = struct
       dirty = XSet.empty;
       merged_values = XSet.empty;
       split_todo = LX.Set.empty;
-      eqs = []
+      eqs = [];
+      neqs = []
     }
 
   let pp ppf t =
@@ -409,19 +413,26 @@ let add_value ?(from_select = false) uf (env, dom, todo) b k v ex =
   else env, dom, todo
 
 (* For the edge [a --i-- b] and the value [a[i] = v]: [a = b] if [b[i] = v] too,
-   since [a] and [b] agree on all the other indices. *)
+   since [a] and [b] agree on all the other indices, and [a <> b] if [b[i] <>
+   v]. *)
 let check_edge uf (env, (dom : Domain.t), todo) { a; k = i; v; ex } b eex =
   let i, ex_i = Uf.find_r uf i in
   match XMap.find i (Domain.values_of b dom) with
   | exception Not_found -> env, dom, todo
-  | w, ex_w ->
+  | w, ex_w -> (
     let v, ex_v = Uf.find_r uf v in
     let w, ex_w' = Uf.find_r uf w in
-    if X.equal v w && not (same_class uf a b)
+    let ex = List.fold_left Ex.union ex [ex_i; ex_w; ex_v; ex_w'; eex] in
+    if X.equal v w
     then
-      let ex = List.fold_left Ex.union ex [ex_i; ex_w; ex_v; ex_w'; eex] in
-      env, { dom with eqs = (a, b, ex) :: dom.eqs }, todo
-    else env, dom, todo
+      if same_class uf a b
+      then env, dom, todo
+      else env, { dom with eqs = (a, b, ex) :: dom.eqs }, todo
+    else
+      match distinct_ex uf v w with
+      | Some ex_d ->
+        env, { dom with neqs = (a, b, Ex.union ex ex_d) :: dom.neqs }, todo
+      | None -> env, dom, todo)
 
 (* Propagate the value [a[k] = v] through the edge [a --i-- b]: add [b[k] = v]
    if [k <> i], call [check_edge] if [k = i]. Otherwise:
@@ -587,19 +598,43 @@ let split_edges uf env (dom : Domain.t) =
     (env, { dom with edge_splits = [] })
     dom.edge_splits
 
+(* The deduced equalities and disequalities that are not known yet. *)
 let flush_eqs uf (dom : Domain.t) =
   let eqs =
-    List.filter (fun (v, w, _) -> not (same_class uf v w)) (List.rev dom.eqs)
+    List.filter_map
+      (fun (v, w, ex) ->
+        if same_class uf v w then None else Some (LX.mkv_eq v w, ex))
+      (List.rev dom.eqs)
   in
-  eqs, { dom with eqs = [] }
+  let neqs =
+    List.filter_map
+      (fun (a, b, ex) ->
+        match are_distinct uf a b with
+        | Th_util.Entailed _ -> None
+        | Unknown -> Some (LX.mkv_distinct false [a; b], ex))
+      (List.rev dom.neqs)
+  in
+  eqs @ neqs, { dom with eqs = []; neqs = [] }
+
+let diff = Symbols.name ~ns:Internal "@diff"
+
+(* Whether a known index [k] has [r[k] <> s[k]]. *)
+let has_witness uf dom r s =
+  let r, _ = Uf.find_r uf r in
+  XMap.exists
+    (fun k (v, _) -> Option.is_some (distinct_value uf dom s k v))
+    (Domain.values_of r dom)
 
 (* For each disequality [r <> s] where [r] and [s] are two arrays, we produce
-   the formula: exists i:ty. (select r i) <> (select s i), where [ty] denotes
-   the type of indices of [r] and [s]. *)
-let extensionality_pair (env, acc) dep r s =
+   the formula: (select r i) <> (select s i) where [i] is the index [(@diff r
+   s)], unless a known index already distinguishes them. The same index is used
+   for the same arrays, even after backtracking. *)
+let extensionality_pair uf dom (env, acc) dep r s =
   match X.type_info r, X.term_extract r, X.term_extract s with
-  | Ty.Tfarray (ty, _), (Some t1, _), (Some t2, _) ->
-    let i = E.fresh_name ty in
+  | Ty.Tfarray (ty, _), (Some t1, _), (Some t2, _)
+    when not (has_witness uf dom r s) ->
+    let t1, t2 = if E.compare t1 t2 <= 0 then t1, t2 else t2, t1 in
+    let i = E.mk_term diff [t1; t2] ty in
     let g1 = E.ArraysEx.select t1 i in
     let g2 = E.ArraysEx.select t2 i in
     let d = E.mk_distinct ~iff:false [g1; g2] in
@@ -609,14 +644,16 @@ let extensionality_pair (env, acc) dep r s =
     env, (Literal.LTerm d, dep, Th_util.Other) :: acc
   | _ -> env, acc
 
-let extensionality acc (a, _, dep, _) =
+let extensionality uf dom acc (a, _, dep, _) =
   match a with
   | A.Distinct (false, (_ :: _ :: _ as l)) ->
     let rec aux acc = function
       | [] | [_] -> acc
       | r :: rl ->
         aux
-          (List.fold_left (fun acc s -> extensionality_pair acc dep r s) acc rl)
+          (List.fold_left
+             (fun acc s -> extensionality_pair uf dom acc dep r s)
+             acc rl)
           rl
     in
     aux acc l
@@ -685,14 +722,13 @@ let assume env uf la =
       let env, dom = split_edges uf env dom in
       let eqs, dom = flush_eqs uf dom in
       let l =
-        List.rev_map
-          (fun (v, w, ex) -> Literal.LSem (LX.mkv_eq v w), ex, Th_util.Other)
-          eqs
+        List.rev_map (fun (eq, ex) -> Literal.LSem eq, ex, Th_util.Other) eqs
       in
       let l = List.rev_append (term_eqs uf env) l in
       { env with term_eqs = [] }, set_domain uf dom, l
   in
-  let env, l = List.fold_left extensionality (env, l) la in
+  let dom = Uf.GlobalDomains.find (module Domain) domains in
+  let env, l = List.fold_left (extensionality uf dom) (env, l) la in
   env, domains, { Sig_rel.assume = l; remove = [] }
 
 let two = Numbers.Q.from_int 2
@@ -745,7 +781,7 @@ let add env uf r t =
     let env, dom = register env dom in
     let env, dom = split_edges uf env dom in
     let eqs, dom = flush_eqs uf dom in
-    env, set_domain uf dom, List.map (fun (v, w, ex) -> LX.mkv_eq v w, ex) eqs
+    env, set_domain uf dom, eqs
   | _ -> env, Uf.domains uf, []
 
 let new_terms env = env.new_terms
