@@ -3327,17 +3327,12 @@ module FP = struct
 
   (* FP -> FP conversion *)
   let to_fp ~eb1 ~sb1 ~eb2 ~sb2 ~mode x =
-    let lit v = float v eb2 sb2 in
-    match float_view x, rounding_mode_view mode with
-    | Some (Fp_value.Finite q), Some m -> lit (Fp_value.of_q eb2 sb2 m q)
-    | ( Some
-          (( Fp_value.NaN | Fp_value.Plus_infinity | Fp_value.Minus_infinity
-           | Fp_value.Plus_zero | Fp_value.Minus_zero ) as v),
-        _ ) ->
-      (* NaN, infinities and zeros are preserved, regardless of the rounding
-         mode. *)
-      lit v
-    | (Some (Fp_value.Finite _) | None), _ ->
+    match
+      Option.bind (float_view x)
+        (Fp_value.convert eb2 sb2 (rounding_mode_view mode))
+    with
+    | Some v -> float v eb2 sb2
+    | None ->
       if eb1 = eb2 && sb1 = sb2
       then x
       else

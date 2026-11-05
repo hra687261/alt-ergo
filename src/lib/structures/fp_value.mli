@@ -77,3 +77,12 @@ val of_q :
     The result is a zero with the sign of [q] when a nonzero [q] underflows to
     zero. When [q] is zero, the result is [Minus_zero] if [neg_zero] is [true]
     (defaults to [false]) and [Plus_zero] otherwise. *)
+
+val to_integer : Fpa_rounding.rounding_mode option -> t -> Numbers.Z.t option
+(** [to_integer mode v] is [v] rounded to an integer with [mode], if it is
+    specified: [v] is finite, and [mode] is known unless [v] is a zero. *)
+
+val convert : int -> int -> Fpa_rounding.rounding_mode option -> t -> t option
+(** [convert eb sb mode v] converts [v] to the format [(eb, sb)] with [mode].
+    NaN, the infinities and the zeros are kept as is, the other values need
+    [mode]. *)

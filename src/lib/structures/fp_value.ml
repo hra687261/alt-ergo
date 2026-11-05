@@ -204,3 +204,14 @@ let of_q ?(neg_zero = false) eb sb mode q =
         | RM.RoundTowardPositive -> if neg then max_fin else inf
         | RM.RoundTowardNegative -> if neg then inf else max_fin
         | RM.RoundTowardZero -> max_fin
+
+let to_integer mode = function
+  | Plus_zero | Minus_zero -> Some Numbers.Z.zero
+  | Finite q ->
+    Option.map (fun m -> Q.to_z (Fpa_rounding.round_to_integer m q)) mode
+  | NaN | Plus_infinity | Minus_infinity -> None
+
+let convert eb sb mode = function
+  | Finite q -> Option.map (fun m -> of_q eb sb m q) mode
+  | (NaN | Plus_infinity | Minus_infinity | Plus_zero | Minus_zero) as v ->
+    Some v

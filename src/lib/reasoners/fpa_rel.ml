@@ -186,6 +186,17 @@ module Domain = struct
     then Some Subnormal
     else None
 
+  (* The predicate [p] applied to [t]. *)
+  let to_expr p ~eb ~sb t =
+    match p with
+    | Nan -> E.FP.is_nan ~eb ~sb t
+    | Zero -> E.FP.is_zero ~eb ~sb t
+    | Infinite -> E.FP.is_infinite ~eb ~sb t
+    | Positive -> E.FP.is_positive ~eb ~sb t
+    | Negative -> E.FP.is_negative ~eb ~sb t
+    | Normal -> E.FP.is_normal ~eb ~sb t
+    | Subnormal -> E.FP.is_subnormal ~eb ~sb t
+
   let rec apply p ~ex ~is_true d =
     if Options.get_debug_fpa () > 0
     then
@@ -194,11 +205,9 @@ module Domain = struct
     let st = if is_true then True ex else False ex in
     let d = upd_pred_status p st d in
     let d =
-      (* if [p] became true, then the predicates in [exclusive_of p] are must be
-         false *)
+      (* [p] true: [exclusive_of p] false. *)
       match st with
       | True _ ->
-        (* Because `ex` is the same as the `ex_st` in [True ex_st] *)
         let neg_st = False ex in
         List.fold_left
           (fun d p -> upd_pred_status p neg_st d)
@@ -217,8 +226,7 @@ module Domain = struct
       (* not NaN & not positive -> negative *)
       apply Negative ~ex:(Ex.union ex_nan ex_p) ~is_true:true d
     | _ -> (
-      (* A float is NaN, infinite, zero, normal or subnormal: if all the classes
-         except one are false, that one is true. *)
+      (* Exactly one class holds: if all others are false, it is true. *)
       let classes = [Nan; Infinite; Zero; Normal; Subnormal] in
       let unknown, ex =
         List.fold_left
@@ -248,7 +256,7 @@ module Domain = struct
 
   let set_pred p is_neg ex d = apply p ~ex ~is_true:(not is_neg) d
 
-  (* Deduce literal FP value equality from predicates *)
+  (* The value determined by [d], if any. *)
   let deduce_fpval_eq d =
     match d.is_nan with
     | True ex -> Some (Fp_value.NaN, ex)
@@ -292,6 +300,13 @@ module Domains = struct
 
   let get r t =
     match MX.find_opt r t.domains with Some d -> d | None -> Domain.unknown
+
+  (* Known status of [p] on [r], with [ex_r] added. *)
+  let status t (r, ex_r) p =
+    match Domain.get_pred_status p (get r t) with
+    | Domain.True ex -> Some (true, Ex.union ex_r ex)
+    | Domain.False ex -> Some (false, Ex.union ex_r ex)
+    | Domain.Unknown -> None
 
   let add_changed r d nd t =
     if Domain.equal d nd
@@ -347,12 +362,11 @@ module AEFloat_arg_watch = struct
 
   type t =
     { apps : args E.Map.t;
-      (* ae.float application -> its (eb, sb, mode) arguments *)
+      (* application -> its arguments *)
       watched_args : E.Set.t MX.t;
-      (* mode value -> ae.float applications that use it as an argument *)
+      (* mode -> applications waiting on it *)
       ready : (int * int * E.t * Ex.t) E.Map.t
-          (* Mapping of ae.float applications to their literal (eb, sb, mode)
-             arguments that are now known *)
+          (* applications whose mode is known *)
     }
 
   type _ Uf.id += Id : t Uf.id
@@ -380,7 +394,7 @@ module AEFloat_arg_watch = struct
 
   let mode_lit_view r = Option.get (X.to_model_term r)
 
-  (* [ready_value] is only called when [mode] is known to be a literal. *)
+  (* [mode] is a constant. *)
   let ready_value eb sb mode ex = eb, sb, mode_lit_view mode, ex
 
   let register term r_eb r_sb r_mode ~ex t =
@@ -478,15 +492,29 @@ let fp_value_of_repr = value_of_repr E.FP.float_view
 
 let mode_of_repr = value_of_repr E.rounding_mode_view
 
+(* Value of [r] if it is a constant, with [ex]. *)
+let get_value value_of (r, ex) = Option.map (fun v -> v, ex) (value_of r)
+
+let get_bv_value = get_value bv_value_of_repr
+
+let get_int_value = get_value int_value_of_repr
+
+let get_real_value = get_value real_value_of_repr
+
+let get_fp_value = get_value fp_value_of_repr
+
+(* Mode of [rep] if known, with its explanation. *)
+let known_mode rep =
+  match get_value mode_of_repr rep with
+  | Some (m, ex) -> Some m, ex
+  | None -> None, Ex.empty
+
 let z_to_int z = Option.get (Z.to_machine_int z)
 
 let real_of_int t = E.mk_term (Sy.Op Sy.Real_of_int) [t] Ty.Treal
 
-(* [to_real(term) = value], where [term] is a finite float of sign [neg], biased
-   exponent [biased_exp] and significand [m]. The value is linear in
-   [bv2nat(m)]: [±(2^(sb-1) + bv2nat(m)) * 2^(biased_exp - bias - (sb-1))] for
-   normal values ([biased_exp > 0]), and [±bv2nat(m) * 2^(1 - bias - (sb-1))]
-   for subnormal ones. *)
+(* [to_real term] for a finite [term = fp neg biased_exp m], linear in [bv2nat
+   m]. *)
 let of_bits_to_real eb sb term ~neg ~biased_exp m =
   let bias = (1 lsl (eb - 1)) - 1 in
   let significand, k =
@@ -502,7 +530,7 @@ let of_bits_to_real eb sb term ~neg ~biased_exp m =
     (E.FP.to_real ~eb ~sb term)
     E.Reals.(of_Q c * real_of_int significand)
 
-(* Range [lo, hi) of the integers that fit in an [n]-bit bit-vector. *)
+(* Integers [[lo, hi)] of an [n]-bit bit-vector. *)
 let bv_range ~signed n =
   if signed
   then
@@ -510,16 +538,14 @@ let bv_range ~signed n =
     Z.minus p, p
   else Z.zero, Z.shift_left Z.one n
 
-(* Number of bits of the magnitude of the integer of an [n]-bit bit-vector: [|i|
-   < 2^n] if unsigned, [|i| <= 2^(n-1)] if signed. *)
 let bv_width bv =
   match E.type_info bv with Ty.Tbitv n -> n | _ -> assert false
 
+(* Bits of the magnitude of the integer of [bv]. *)
 let bv_int_bits ~signed bv = if signed then bv_width bv - 1 else bv_width bv
 
-(* [Some (bv, signed)] if [i] is the integer of the bit-vector [bv] (see
-   [E.FP.of_bv_int_view]) and its conversion to the format [(eb, sb)] is
-   exact. *)
+(* [Some (bv, signed)] if [i] is the integer of [bv] and is exact in [(eb,
+   sb)]. *)
 let exact_bv_int eb sb i =
   match E.FP.of_bv_int_view i with
   | Some (bv, signed) ->
@@ -534,10 +560,9 @@ let exact_bv_int eb sb i =
     else None
   | None -> None
 
-(* Facts on [term = ae.fp.of_int eb sb mode i] when [i] is the integer of a
-   bit-vector whose conversion cannot overflow: [term] is finite, positive if
-   [i] is unsigned, and its real value is [i] rounded with [ae.float] ([i]
-   itself if it is exact). *)
+(* [term = of_int mode i], [i] the integer of a bit-vector that cannot overflow:
+   [term] is finite, positive if unsigned, and [to_real term] is [i], rounded
+   unless exact. *)
 let of_bv_int_facts term =
   match E.term_view term with
   | { E.xs = [eb_t; sb_t; mode; i]; ty = Ty.Tfloat (eb, sb); _ } -> (
@@ -569,35 +594,45 @@ let of_bv_int_facts term =
     | None -> [])
   | _ -> []
 
-(* Watches the conversion applications that are reasoned about by this module
-   rather than by the prelude, the same way [Bitv_rel.BV2Nat] watches [int2bv]
-   and [bv2nat]: [Sy.Float_of_bits] (see [E.FP.fp]), [Sy.Float_to_fp] (see
-   [E.FP.to_fp]), [Sy.Float_to_ubv] and [Sy.Float_to_sbv], and [ae.fp.of_int],
-   [ae.fp.from_real] and [ae.fp.to_int].
+let float_format t =
+  match E.type_info t with Ty.Tfloat (eb, sb) -> eb, sb | _ -> assert false
 
-   Each application stores the representatives of itself and of its arguments
-   (other than [eb] and [sb]), with the explanations of their equalities with
-   the terms, which [subst] updates. An application is examined when it is
-   registered and, in [propagate], when one of its representatives or their
-   classes change. Examining it gives the facts that follow from what is known
-   on its representatives; the facts that are already known are no-ops. *)
+let lit_fact ex f = Literal.LTerm f, ex, Th_util.Other
+
+let sem_fact ex l = Literal.LSem (Shostak.L.view l), ex, Th_util.Other
+
+let eq_fact ex r1 r2 = sem_fact ex (Shostak.L.mk_eq r1 r2)
+
+let eq_lit_fact ex r t = eq_fact ex r (fst (X.make t))
+
+let pred_fact ex mk ~eb ~sb t b =
+  let f = mk ~eb ~sb t in
+  lit_fact ex (if b then f else E.neg f)
+
+(* [t = v], as a term so that [v] gets its literal facts. *)
+let eq_float_fact ex t v eb sb =
+  lit_fact ex (E.mk_eq ~iff:false t (E.float v eb sb))
+
+(* Native reasoning on the conversions of [conv_kind], like [Bitv_rel.BV2Nat].
+
+   An application keeps its representatives and those of its arguments, with
+   explanations. Its rules run when it is registered, and when a representative
+   or its class changes. Known facts are no-ops, so rules just re-emit them. *)
 module Conv_watch = struct
-  type rep = X.r * Ex.t
-
   type args =
     | Bits of
-        { sign : rep;
-          exp : rep;
-          mant : rep
+        { sign : X.r * Ex.t;
+          exp : X.r * Ex.t;
+          mant : X.r * Ex.t
         }  (** of [fp sign exp mant] *)
     | Rounded of
-        { mode : rep;
-          arg : rep
+        { mode : X.r * Ex.t;
+          arg : X.r * Ex.t
         }  (** of the other conversions, applied to [mode] and [arg] *)
 
   type app =
     { kind : conv_kind;
-      r : rep;  (** the application *)
+      r : X.r * Ex.t;  (** the application *)
       args : args
     }
 
@@ -606,15 +641,11 @@ module Conv_watch = struct
     | Bits { sign; exp; mant } -> [app.r; sign; exp; mant]
     | Rounded { mode; arg } -> [app.r; mode; arg]
 
-  type fact =
-    | Sem of X.r Xliteral.view * Ex.t
-    | Term of E.t * Ex.t
-
   type t =
     { apps : app E.Map.t;
       watched : E.Set.t MX.t;  (** representative -> applications using it *)
-      dirty : E.Set.t;  (** applications to examine in [propagate] *)
-      facts : fact list  (** pending facts *)
+      dirty : E.Set.t;  (** applications to rerun *)
+      facts : X.r Sig_rel.fact list  (** pending facts *)
     }
 
   type _ Uf.id += Id : t Uf.id
@@ -634,239 +665,199 @@ module Conv_watch = struct
   let watchers r t =
     match MX.find_opt r t.watched with Some s -> s | None -> E.Set.empty
 
-  (* Facts. *)
+  let all_ones eb = Z.sub (Z.shift_left Z.one eb) Z.one
 
-  let ex_of l = List.fold_left (fun acc (_, ex) -> Ex.union acc ex) Ex.empty l
+  (* Value, once the bits are known. *)
+  let of_bits_eval ~eb ~sb term s e m =
+    match s, e, m with
+    | Some (zs, ex_s), Some (ze, ex_e), Some (zm, ex_m) ->
+      let v =
+        Fp_value.mk_fp_literal ~neg:(Z.equal zs Z.one) ~biased_exp:(z_to_int ze)
+          ~mantissa:zm ~eb ~sb
+      in
+      [eq_float_fact (Ex.union ex_s (Ex.union ex_e ex_m)) term v eb sb]
+    | _ -> []
 
-  let eq ex r1 r2 = Sem (Shostak.L.(view (mk_eq r1 r2)), ex)
+  (* Classes, from the exponent and the significand. *)
+  let of_bits_classes ~eb ~sb term e m =
+    let pred ex mk b = pred_fact ex mk ~eb ~sb term b in
+    match e, m with
+    | Some (ze, ex_e), _ when Z.equal ze (all_ones eb) -> (
+      (* NaN or infinite, infinite iff [m = 0]. *)
+      [pred ex_e E.FP.is_zero false; pred ex_e E.FP.is_finite false]
+      @
+      match m with
+      | Some (zm, ex_m) ->
+        let ex = Ex.union ex_e ex_m in
+        let zero_m = Z.equal zm Z.zero in
+        pred ex E.FP.is_nan (not zero_m)
+        :: (if zero_m then [pred ex E.FP.is_infinite true] else [])
+      | None -> [])
+    | Some (ze, ex_e), _ -> (
+      (* Finite, zero iff [e = m = 0]. *)
+      [ pred ex_e E.FP.is_nan false;
+        pred ex_e E.FP.is_infinite false;
+        pred ex_e E.FP.is_finite true ]
+      @
+      match m with
+      | _ when not (Z.equal ze Z.zero) -> [pred ex_e E.FP.is_zero false]
+      | Some (zm, ex_m) ->
+        [pred (Ex.union ex_e ex_m) E.FP.is_zero (Z.equal zm Z.zero)]
+      | None -> [])
+    | None, _ -> []
 
-  let eq_lit ex r t = eq ex r (fst (X.make t))
+  (* Explanation of not NaN, if known. *)
+  let of_bits_not_nan ~eb domains rep_r e m =
+    match e, m with
+    | Some (ze, ex_e), _ when not (Z.equal ze (all_ones eb)) -> Some ex_e
+    | Some (_, ex_e), Some (zm, ex_m) when Z.equal zm Z.zero ->
+      Some (Ex.union ex_e ex_m)
+    | _ -> (
+      match Domains.status domains rep_r Nan with
+      | Some (false, ex) -> Some ex
+      | _ -> None)
 
-  let lit ex f = Term (f, ex)
+  (* Sign of a non-NaN: [s]. *)
+  let of_bits_sign ~eb ~sb term s not_nan =
+    match s, not_nan with
+    | Some (zs, ex_s), Some ex_nn ->
+      let ex = Ex.union ex_s ex_nn in
+      let neg = Z.equal zs Z.one in
+      [ pred_fact ex E.FP.is_negative ~eb ~sb term neg;
+        pred_fact ex E.FP.is_positive ~eb ~sb term (not neg) ]
+    | _ -> []
 
-  let pred ex mk ~eb ~sb t b =
-    let f = mk ~eb ~sb t in
-    lit ex (if b then f else E.neg f)
+  (* Real value, if finite. *)
+  let of_bits_real ~eb ~sb term m_term s e =
+    match s, e with
+    | Some (zs, ex_s), Some (ze, ex_e) when not (Z.equal ze (all_ones eb)) ->
+      [ lit_fact (Ex.union ex_s ex_e)
+          (of_bits_to_real eb sb term ~neg:(Z.equal zs Z.one)
+             ~biased_exp:(z_to_int ze) m_term) ]
+    | _ -> []
 
-  (* [t = v] as a term, so that the literal [v] is added with its facts. *)
-  let eq_float ex t v eb sb = lit ex (E.mk_eq ~iff:false t (E.float v eb sb))
+  (* Bits, once the value is known; NaN: [e] all ones, [m <> 0]. *)
+  let of_bits_args ~eb ~sb rep_r ~sign:(rs, ex_s) ~exp:(re, ex_e)
+      ~mant:(rm, ex_m) =
+    let bv sz z = E.BV.of_Z ~size:sz z in
+    match get_fp_value rep_r with
+    | None -> []
+    | Some (v, ex_r) -> (
+      match Fp_value.to_bits eb sb v with
+      | Some (neg, biased_exp, mantissa) ->
+        [ eq_lit_fact (Ex.union ex_r ex_s) rs
+            (bv 1 (if neg then Z.one else Z.zero));
+          eq_lit_fact (Ex.union ex_r ex_e) re (bv eb (Z.from_int biased_exp));
+          eq_lit_fact (Ex.union ex_r ex_m) rm (bv (sb - 1) mantissa) ]
+      | None ->
+        let zero_m = fst (X.make (bv (sb - 1) Z.zero)) in
+        [ eq_lit_fact (Ex.union ex_r ex_e) re (bv eb (all_ones eb));
+          sem_fact (Ex.union ex_r ex_m)
+            (Shostak.L.mk_distinct false [rm; zero_m]) ])
 
-  let class_pred : Domain.pred -> eb:int -> sb:int -> E.t -> E.t = function
-    | Nan -> E.FP.is_nan
-    | Zero -> E.FP.is_zero
-    | Infinite -> E.FP.is_infinite
-    | Positive -> E.FP.is_positive
-    | Negative -> E.FP.is_negative
-    | Normal -> E.FP.is_normal
-    | Subnormal -> E.FP.is_subnormal
+  (* Injectivity on non-NaN: [fp] applications in the same class have equal
+     bits. *)
+  let of_bits_injectivity t term (r, ex_r) not_nan ~sign ~exp ~mant =
+    let same ex (r1, ex1) (r2, ex2) =
+      eq_fact (Ex.union ex (Ex.union ex1 ex2)) r1 r2
+    in
+    match not_nan with
+    | None -> []
+    | Some ex_nn ->
+      E.Set.fold
+        (fun term' acc ->
+          match E.Map.find_opt term' t.apps with
+          | Some { kind = Of_bits; r = r', ex_r'; args = Bits b' }
+            when (not (E.equal term term')) && X.equal r r' ->
+            let ex = Ex.union ex_nn (Ex.union ex_r ex_r') in
+            same ex sign b'.sign :: same ex exp b'.exp :: same ex mant b'.mant
+            :: acc
+          | _ -> acc)
+        (watchers r t) []
 
-  (* Status of the class [p] of the representative [r], if it is known. *)
-  let status domains (r, ex_r) p =
-    match Domain.get_pred_status p (Domains.get r domains) with
-    | Domain.True ex -> Some (true, Ex.union ex_r ex)
-    | Domain.False ex -> Some (false, Ex.union ex_r ex)
-    | Domain.Unknown -> None
-
-  let float_format t =
-    match E.type_info t with Ty.Tfloat (eb, sb) -> eb, sb | _ -> assert false
-
-  (* [term = fp s e m]. *)
-  let of_bits domains t term ((r, _) as rep_r) ~sign:((rs, _) as rep_s)
-      ~exp:((re, _) as rep_e) ~mant:((rm, _) as rep_m) =
+  (* [term = fp sign exp mant]. *)
+  let of_bits domains t term rep_r ~sign ~exp ~mant =
     match E.term_view term with
-    | { E.xs = [_; _; _; _; m]; ty = Ty.Tfloat (eb, sb); _ } ->
-      let vs = bv_value_of_repr rs in
-      let ve = bv_value_of_repr re in
-      let vm = bv_value_of_repr rm in
-      let ones = Z.sub (Z.shift_left Z.one eb) Z.one in
-      let pred ex mk b = pred ex mk ~eb ~sb term b in
-      (* Evaluation. *)
-      let eval =
-        match vs, ve, vm with
-        | Some zs, Some ze, Some zm ->
-          let v =
-            Fp_value.mk_fp_literal ~neg:(Z.equal zs Z.one)
-              ~biased_exp:(z_to_int ze) ~mantissa:zm ~eb ~sb
-          in
-          [eq_float (ex_of [rep_s; rep_e; rep_m]) term v eb sb]
-        | _ -> []
-      in
-      (* Classes from the exponent: all ones for NaN and the infinities,
-         otherwise finite, and zero only if the exponent is zero. *)
-      let exp_classes =
-        let ex = ex_of [rep_e] in
-        match ve with
-        | Some ze when Z.equal ze ones ->
-          [pred ex E.FP.is_zero false; pred ex E.FP.is_finite false]
-        | Some ze ->
-          [ pred ex E.FP.is_nan false;
-            pred ex E.FP.is_infinite false;
-            pred ex E.FP.is_finite true ]
-          @ if Z.equal ze Z.zero then [] else [pred ex E.FP.is_zero false]
-        | None -> []
-      in
-      (* Classes from the exponent and the significand: with an exponent of all
-         ones, a zero significand is an infinity and any other is NaN; with a
-         zero exponent, a zero significand is a zero. *)
-      let sig_classes =
-        let ex = ex_of [rep_e; rep_m] in
-        match ve, vm with
-        | Some ze, Some zm when Z.equal ze ones ->
-          let zero_m = Z.equal zm Z.zero in
-          pred ex E.FP.is_nan (not zero_m)
-          :: (if zero_m then [pred ex E.FP.is_infinite true] else [])
-        | Some ze, Some zm when Z.equal ze Z.zero ->
-          [pred ex E.FP.is_zero (Z.equal zm Z.zero)]
-        | _ -> []
-      in
-      (* [not (is_nan term)], with its explanation, if it is known. *)
-      let not_nan =
-        match ve, vm with
-        | Some ze, _ when not (Z.equal ze ones) -> Some (ex_of [rep_e])
-        | Some _, Some zm when Z.equal zm Z.zero -> Some (ex_of [rep_e; rep_m])
-        | _ -> (
-          match status domains rep_r Nan with
-          | Some (false, ex) -> Some ex
-          | _ -> None)
-      in
-      (* Sign of a non-NaN value. *)
-      let sign =
-        match vs, not_nan with
-        | Some zs, Some ex ->
-          let ex = Ex.union ex (ex_of [rep_s]) in
-          let neg = Z.equal zs Z.one in
-          [pred ex E.FP.is_negative neg; pred ex E.FP.is_positive (not neg)]
-        | _ -> []
-      in
-      (* Real value of a finite value, linear in [bv2nat(m)]. *)
-      let real =
-        match vs, ve with
-        | Some zs, Some ze when not (Z.equal ze ones) ->
-          [ lit
-              (ex_of [rep_s; rep_e])
-              (of_bits_to_real eb sb term ~neg:(Z.equal zs Z.one)
-                 ~biased_exp:(z_to_int ze) m) ]
-        | _ -> []
-      in
-      (* Bits of a known value. A NaN only has an exponent of all ones and a
-         nonzero significand. *)
-      let bits =
-        let bv sz z = E.BV.of_Z ~size:sz z in
-        match Option.map (Fp_value.to_bits eb sb) (fp_value_of_repr r) with
-        | None -> []
-        | Some (Some (neg, biased_exp, mantissa)) ->
-          let zs = if neg then Z.one else Z.zero in
-          [ eq_lit (ex_of [rep_r; rep_s]) rs (bv 1 zs);
-            eq_lit (ex_of [rep_r; rep_e]) re (bv eb (Z.from_int biased_exp));
-            eq_lit (ex_of [rep_r; rep_m]) rm (bv (sb - 1) mantissa) ]
-        | Some None ->
-          let zero_m = fst (X.make (bv (sb - 1) Z.zero)) in
-          [ eq_lit (ex_of [rep_r; rep_e]) re (bv eb ones);
-            Sem
-              ( Shostak.L.(view (mk_distinct false [rm; zero_m])),
-                ex_of [rep_r; rep_m] ) ]
-      in
-      (* Injectivity on non-NaN values: the other [of_bits] applications with
-         the same value have the same arguments. *)
-      let injectivity =
-        match not_nan with
-        | None -> []
-        | Some ex_nn ->
-          E.Set.fold
-            (fun term' acc ->
-              match E.Map.find_opt term' t.apps with
-              | Some { kind = Of_bits; r = rep_r'; args = Bits b' }
-                when (not (E.equal term term')) && X.equal r (fst rep_r') ->
-                let ex = Ex.union ex_nn (ex_of [rep_r; rep_r']) in
-                let same (ri, ex_i) (ri', ex_i') =
-                  eq (Ex.union ex (Ex.union ex_i ex_i')) ri ri'
-                in
-                same rep_s b'.sign :: same rep_e b'.exp :: same rep_m b'.mant
-                :: acc
-              | _ -> acc)
-            (watchers r t) []
-      in
-      List.concat [eval; exp_classes; sig_classes; sign; real; bits; injectivity]
+    | { E.xs = [_; _; _; _; m_term]; ty = Ty.Tfloat (eb, sb); _ } ->
+      let s = get_bv_value sign in
+      let e = get_bv_value exp in
+      let m = get_bv_value mant in
+      let not_nan = of_bits_not_nan ~eb domains rep_r e m in
+      List.concat
+        [ of_bits_eval ~eb ~sb term s e m;
+          of_bits_classes ~eb ~sb term e m;
+          of_bits_sign ~eb ~sb term s not_nan;
+          of_bits_real ~eb ~sb term m_term s e;
+          of_bits_args ~eb ~sb rep_r ~sign ~exp ~mant;
+          of_bits_injectivity t term rep_r not_nan ~sign ~exp ~mant ]
     | _ -> assert false
 
-  (* [term = of_int mode i] or [term = from_real mode r], where [value_of] gives
-     the value of the argument. *)
-  let of_number value_of term ~mode:((r_mode, _) as rep_mode)
-      ~arg:((r_arg, _) as rep_arg) =
+  (* [term = of_int mode i]: value, once [mode] and [i] are known. *)
+  let of_int term ~mode ~arg =
     let eb, sb = float_format term in
-    (* Evaluation. *)
-    match mode_of_repr r_mode, value_of r_arg with
-    | Some m, Some q ->
-      [eq_float (ex_of [rep_mode; rep_arg]) term (Fp_value.of_q eb sb m q) eb sb]
+    match known_mode mode, get_int_value arg with
+    | (Some m, ex_m), Some (i, ex_i) ->
+      [ eq_float_fact (Ex.union ex_m ex_i) term
+          (Fp_value.of_q eb sb m (Q.from_z i))
+          eb sb ]
     | _ -> []
 
-  (* [term = to_int mode x]. *)
-  let to_int ((r, _) as rep_r) ~mode:((r_mode, _) as rep_mode)
-      ~arg:((r_x, _) as rep_x) =
-    (* Evaluation, where the result is specified. *)
-    match mode_of_repr r_mode, fp_value_of_repr r_x with
-    | Some m, Some (Fp_value.Finite q) ->
-      [ eq_lit
-          (ex_of [rep_r; rep_mode; rep_x])
-          r
-          (E.Ints.of_Q_exn (Fpa_rounding.round_to_integer m q)) ]
-    | _, Some (Fp_value.Plus_zero | Fp_value.Minus_zero) ->
-      [eq_lit (ex_of [rep_r; rep_x]) r (E.Ints.of_int 0)]
+  (* [term = from_real mode r]: value, once [mode] and [r] are known. *)
+  let of_real term ~mode ~arg =
+    let eb, sb = float_format term in
+    match known_mode mode, get_real_value arg with
+    | (Some m, ex_m), Some (q, ex_q) ->
+      [eq_float_fact (Ex.union ex_m ex_q) term (Fp_value.of_q eb sb m q) eb sb]
     | _ -> []
 
-  (* [term = to_fp mode x], from the format [(eb1, sb1)] of [x] to the format
-     [(eb2, sb2)] of [term]. *)
-  let to_fp domains term rep_r ~mode:((r_mode, _) as rep_mode)
-      ~arg:((r_x, _) as rep_x) =
+  (* [term = to_int mode x]: value, where specified. *)
+  let to_int (r, ex_r) ~mode ~arg =
+    let m, ex_m = known_mode mode in
+    match get_fp_value arg with
+    | Some (v, ex_x) -> (
+      match Fp_value.to_integer m v with
+      | Some z ->
+        [eq_lit_fact (Ex.union ex_r (Ex.union ex_m ex_x)) r (E.Ints.of_Z z)]
+      | None -> [])
+    | None -> []
+
+  (* [term = to_fp mode x], from [(eb1, sb1)] to [(eb2, sb2)]. *)
+  let to_fp domains term rep_r ~mode:rep_mode ~arg:rep_x =
     match E.term_view term with
     | { E.xs = [eb_t; sb_t; mode; x]; ty = Ty.Tfloat (eb2, sb2); _ } ->
       let eb1, sb1 = float_format x in
-      (* A conversion to a format at least as wide is exact. *)
+      (* Widening is exact. *)
       let exact = eb1 <= eb2 && sb1 <= sb2 in
-      (* Evaluation. NaN, the infinities and the zeros are kept as is. *)
+      (* Value, once [x] (and [mode] if [x] is finite) is known. *)
       let eval =
-        match fp_value_of_repr r_x, mode_of_repr r_mode with
-        | Some (Fp_value.Finite q), Some m ->
-          [ eq_float
-              (ex_of [rep_mode; rep_x])
-              term
-              (Fp_value.of_q eb2 sb2 m q)
-              eb2 sb2 ]
-        | Some (Fp_value.Finite _), None | None, _ -> []
-        | Some v, _ -> [eq_float (ex_of [rep_x]) term v eb2 sb2]
+        let m, ex_m = known_mode rep_mode in
+        match get_fp_value rep_x with
+        | Some (v, ex_x) -> (
+          match Fp_value.convert eb2 sb2 m v with
+          | Some v -> [eq_float_fact (Ex.union ex_m ex_x) term v eb2 sb2]
+          | None -> [])
+        | None -> []
       in
-      (* The class [p] of [src] is that of [dst] when its status satisfies
-         [cond]. *)
-      let transfer (src, dst, eb, sb) cond p =
-        match status domains src p with
-        | Some (b, ex) when cond b -> [pred ex (class_pred p) ~eb ~sb dst b]
+      (* Copies the status of [p] from [x] to [term], if [cond] holds. *)
+      let from_arg ?(cond = Fun.const true) p =
+        match Domains.status domains rep_x p with
+        | Some (b, ex) when cond b ->
+          [pred_fact ex (Domain.to_expr p) ~eb:eb2 ~sb:sb2 term b]
         | _ -> []
       in
-      let forward = rep_x, term, eb2, sb2 in
-      let backward = rep_r, x, eb1, sb1 in
-      let always _ = true in
-      (* NaN and the sign are kept. *)
-      let kept =
-        List.concat_map
-          (fun p -> transfer forward always p @ transfer backward always p)
-          [Domain.Nan; Positive; Negative]
+      (* Copies the status of [p] from [term] to [x], if [cond] holds. *)
+      let from_term ?(cond = Fun.const true) p =
+        match Domains.status domains rep_r p with
+        | Some (b, ex) when cond b ->
+          [pred_fact ex (Domain.to_expr p) ~eb:eb1 ~sb:sb1 x b]
+        | _ -> []
       in
-      (* The infinities and the zeros are kept. An exact conversion has no
-         others, but a narrowing one can overflow or underflow. *)
-      let special =
-        List.concat_map
-          (fun p ->
-            transfer forward (fun b -> b || exact) p
-            @ transfer backward (fun b -> (not b) || exact) p)
-          [Domain.Infinite; Zero]
-      in
-      (* Real value of a finite [x] whose conversion does not overflow: that of
-         [x], rounded unless the conversion is exact. *)
+      (* [x] and [term] finite: [to_real x], rounded unless exact. *)
       let real =
         match
-          ( status domains rep_x Nan,
-            status domains rep_x Infinite,
-            status domains rep_r Infinite )
+          ( Domains.status domains rep_x Nan,
+            Domains.status domains rep_x Infinite,
+            Domains.status domains rep_r Infinite )
         with
         | Some (false, ex1), Some (false, ex2), Some (false, ex3) ->
           let real_x = E.FP.to_real ~eb:eb1 ~sb:sb1 x in
@@ -875,39 +866,58 @@ module Conv_watch = struct
             then real_x
             else E.mk_term (Sy.Op FloatEbSb) [eb_t; sb_t; mode; real_x] Ty.Treal
           in
-          [ lit
+          [ lit_fact
               (Ex.union ex1 (Ex.union ex2 ex3))
               (E.mk_eq ~iff:false (E.FP.to_real ~eb:eb2 ~sb:sb2 term) value) ]
         | _ -> []
       in
-      List.concat [eval; kept; special; real]
+      (* Narrowing can overflow or underflow: only infinite or zero is copied
+         forward, and only finite or nonzero backward. *)
+      let if_true b = b || exact in
+      let if_false b = (not b) || exact in
+      List.concat
+        [ eval;
+          (* NaN and the sign are kept. *)
+          from_arg Nan;
+          from_term Nan;
+          from_arg Positive;
+          from_term Positive;
+          from_arg Negative;
+          from_term Negative;
+          (* Infinite and zero, unless narrowing. *)
+          from_arg Infinite ~cond:if_true;
+          from_term Infinite ~cond:if_false;
+          from_arg Zero ~cond:if_true;
+          from_term Zero ~cond:if_false;
+          real ]
     | _ -> assert false
 
   (* [term = to_ubv n mode x] ([signed = false]) or [term = to_sbv n mode x]. *)
-  let to_bv t term ~signed n ((r, _) as rep_r) ~mode:((r_mode, _) as rep_mode)
-      ~arg:((r_x, _) as rep_x) =
+  let to_bv t term ~signed n (r, ex_r) ~mode ~arg:((r_x, _) as rep_x) =
     let lo, hi = bv_range ~signed n in
-    (* Evaluation, where the result is specified: a finite value in range. *)
+    (* Value, if finite and in range. *)
     let eval =
-      match mode_of_repr r_mode, fp_value_of_repr r_x with
-      | Some m, Some (Fp_value.Finite q) ->
-        let z = Q.to_z (Fpa_rounding.round_to_integer m q) in
-        if Z.compare lo z <= 0 && Z.compare z hi < 0
-        then [eq_lit (ex_of [rep_r; rep_mode; rep_x]) r (E.BV.of_Z ~size:n z)]
-        else []
-      | _, Some (Fp_value.Plus_zero | Fp_value.Minus_zero) ->
-        [eq_lit (ex_of [rep_r; rep_x]) r (E.BV.of_Z ~size:n Z.zero)]
-      | _ -> []
+      let m, ex_m = known_mode mode in
+      match get_fp_value rep_x with
+      | Some (v, ex_x) -> (
+        match Fp_value.to_integer m v with
+        | Some z when Z.compare lo z <= 0 && Z.compare z hi < 0 ->
+          [ eq_lit_fact
+              (Ex.union ex_r (Ex.union ex_m ex_x))
+              r (E.BV.of_Z ~size:n z) ]
+        | _ -> [])
+      | None -> []
     in
-    (* The conversion of an exact conversion of the integer of a bit-vector [bv]
-       is [bv], extended to [n] bits, if all its values fit. *)
+    (* [x = of_int(int(bv))] exact and [bv] fits in [n] bits: [term] is [bv]
+       extended. *)
     let of_exact =
       E.Set.fold
         (fun term' acc ->
           match E.Map.find_opt term' t.apps, E.term_view term' with
-          | ( Some { kind = Of_int; r = rep_i; _ },
+          | ( Some { kind = Of_int; r = r_i, ex_i; _ },
               { E.xs = [_; _; _; i]; ty = Ty.Tfloat (eb, sb); _ } )
-            when X.equal r_x (fst rep_i) -> (
+            when X.equal r_x r_i -> (
+            let ex_x = snd rep_x in
             match exact_bv_int eb sb i with
             | Some (bv, signed') ->
               let n' = bv_width bv in
@@ -919,7 +929,8 @@ module Conv_watch = struct
                   then E.BV.sign_extend (n - n') bv
                   else E.BV.zero_extend (n - n') bv
                 in
-                lit (ex_of [rep_x; rep_i]) (E.mk_eq ~iff:false term ext) :: acc
+                lit_fact (Ex.union ex_x ex_i) (E.mk_eq ~iff:false term ext)
+                :: acc
               else acc
             | None -> acc)
           | _ -> acc)
@@ -927,17 +938,14 @@ module Conv_watch = struct
     in
     eval @ of_exact
 
-  (* Adds the facts of the application [term]. *)
-  let examine domains term app t =
+  (* Runs the rules of [term] and queues their facts. *)
+  let apply_conv_rules domains term app t =
     let facts =
       match app.kind, app.args with
       | Of_bits, Bits { sign; exp; mant } ->
         of_bits domains t term app.r ~sign ~exp ~mant
-      | Of_int, Rounded { mode; arg } ->
-        let int_value r = Option.map Q.from_z (int_value_of_repr r) in
-        of_number int_value term ~mode ~arg
-      | Of_real, Rounded { mode; arg } ->
-        of_number real_value_of_repr term ~mode ~arg
+      | Of_int, Rounded { mode; arg } -> of_int term ~mode ~arg
+      | Of_real, Rounded { mode; arg } -> of_real term ~mode ~arg
       | To_int, Rounded { mode; arg } -> to_int app.r ~mode ~arg
       | To_fp, Rounded { mode; arg } -> to_fp domains term app.r ~mode ~arg
       | To_bv (signed, n), Rounded { mode; arg } ->
@@ -970,18 +978,16 @@ module Conv_watch = struct
           t.watched (reps app)
       in
       let t = { t with apps = E.Map.add term app t.apps; watched } in
-      (* Facts that follow from the arguments of [term] alone. *)
+      (* Facts from the arguments alone. *)
       let t =
         match kind with
         | Of_int ->
-          let facts =
-            List.map (fun f -> Term (f, Ex.empty)) (of_bv_int_facts term)
-          in
+          let facts = List.map (lit_fact Ex.empty) (of_bv_int_facts term) in
           { t with facts = facts @ t.facts }
         | _ -> t
       in
       let domains = Uf.GlobalDomains.find (module Domains) (Uf.domains uf) in
-      examine domains term app t
+      apply_conv_rules domains term app t
 
   let subst ~ex rr nrr t =
     match MX.find_opt rr t.watched with
@@ -1005,8 +1011,7 @@ module Conv_watch = struct
           (fun term apps -> E.Map.update term (Option.map update_reps) apps)
           terms t.apps
       in
-      (* The applications on [nrr] are examined in [propagate], including the
-         ones already there, for the rules relating two applications. *)
+      (* All applications on [nrr] rerun, for the rules relating two. *)
       let on_nrr = E.Set.union terms (watchers nrr t) in
       { t with
         apps;
@@ -1014,8 +1019,7 @@ module Conv_watch = struct
         dirty = E.Set.union on_nrr t.dirty
       }
 
-  (* Examines the applications whose representatives changed, and the ones on
-     the representatives whose classes changed in [domains]. *)
+  (* Reruns the dirty applications and those on the [changed] classes. *)
   let propagate domains changed t =
     let terms =
       SX.fold (fun r acc -> E.Set.union (watchers r t) acc) changed t.dirty
@@ -1023,23 +1027,12 @@ module Conv_watch = struct
     E.Set.fold
       (fun term t ->
         match E.Map.find_opt term t.apps with
-        | Some app -> examine domains term app t
+        | Some app -> apply_conv_rules domains term app t
         | None -> t)
       terms
       { t with dirty = E.Set.empty }
 
-  let split facts =
-    List.partition_map
-      (function Sem (eq, ex) -> Left (eq, ex) | Term (f, ex) -> Right (f, ex))
-      facts
-
-  let flush t =
-    let eqs, lits = split t.facts in
-    eqs, lits, { t with facts = [] }
-
-  let flush_eqs t =
-    let eqs, lits = split t.facts in
-    eqs, { t with facts = List.map (fun (f, ex) -> Term (f, ex)) lits }
+  let flush t = t.facts, { t with facts = [] }
 end
 
 type t =
@@ -1047,7 +1040,7 @@ type t =
     pending_literals : (E.t * E.t) list;
     literals_cache : (int * int, precision_literals) Hashtbl.t;
     new_terms : E.Set.t;
-    defs : E.Set.t (* Applications defined by lemmas (see [definitions]). *)
+    defs : E.Set.t (* applications defined by lemmas, see [definitions] *)
   }
 
 let empty uf =
@@ -1224,16 +1217,16 @@ let flush_domain_facts domains =
         mk_eq_fpval_fact rr fp_val ex :: acc)
     [] domains
 
-(* Registers [term] in [Conv_watch] if it is a conversion application, and
-   returns the equalities between representatives deduced on registration. *)
+(* Registers [term] in [Conv_watch] if it is a conversion. *)
 let register_conv uf term ds =
   match conv_kind term with
   | Some kind ->
     let cw = Uf.GlobalDomains.find (module Conv_watch) ds in
-    let cw = Conv_watch.register uf term kind cw in
-    let eqs, cw = Conv_watch.flush_eqs cw in
-    Uf.GlobalDomains.add (module Conv_watch) cw ds, eqs
-  | None -> ds, []
+    Uf.GlobalDomains.add
+      (module Conv_watch)
+      (Conv_watch.register uf term kind cw)
+      ds
+  | None -> ds
 
 let register_aefloat_arg_watch uf term ds =
   match E.term_view term with
@@ -1314,8 +1307,7 @@ let add env uf _r term =
           }
         | _ -> env
       in
-      let ds, eqs = register_conv uf term (Uf.domains uf) in
-      env, ds, eqs
+      env, register_conv uf term (Uf.domains uf), []
     | Ty.Treal ->
       (* ae.float applies ae.round on reals *)
       let ds = register_aefloat_arg_watch uf term (Uf.domains uf) in
@@ -1326,16 +1318,14 @@ let add env uf _r term =
         | Some (To_bv _) -> { env with defs = E.Set.add term env.defs }
         | _ -> env
       in
-      let ds, eqs = register_conv uf term (Uf.domains uf) in
-      env, ds, eqs
+      env, register_conv uf term (Uf.domains uf), []
     | _ ->
       let env =
         if Option.is_some (normal_pred term)
         then { env with defs = E.Set.add term env.defs }
         else env
       in
-      let ds, eqs = register_conv uf term (Uf.domains uf) in
-      env, ds, eqs
+      env, register_conv uf term (Uf.domains uf), []
 
 let mk_aefloat_eq_fact term (eb, sb, mode, ex) =
   match E.term_view term with
@@ -1388,25 +1378,18 @@ let assume env uf la =
     let ds = Uf.GlobalDomains.add (module Domains) domains ds in
     let conv_watch = Uf.GlobalDomains.find (module Conv_watch) ds in
     let conv_watch = Conv_watch.propagate domains changed conv_watch in
-    let conv_eqs, conv_lits, conv_watch = Conv_watch.flush conv_watch in
-    let conv_facts =
-      List.rev_append
-        (List.rev_map
-           (fun (eq, ex) -> Literal.LSem eq, ex, Th_util.Other)
-           conv_eqs)
-        (List.rev_map
-           (fun (f, ex) -> Literal.LTerm f, ex, Th_util.Other)
-           conv_lits)
-    in
+    let conv_facts, conv_watch = Conv_watch.flush conv_watch in
     let ds = Uf.GlobalDomains.add (module Conv_watch) conv_watch ds in
-    (* The terms of the facts, which can be new, are made visible to
-       matching. *)
+    (* New terms of the facts, for matching. *)
     let env =
       { env with
         new_terms =
           List.fold_left
-            (fun acc (f, _) -> E.Set.union (E.max_terms_of_lit f) acc)
-            env.new_terms conv_lits
+            (fun acc (lit, _, _) ->
+              match lit with
+              | Literal.LTerm f -> E.Set.union (E.max_terms_of_lit f) acc
+              | Literal.LSem _ -> acc)
+            env.new_terms conv_facts
       }
     in
     let aefloat_arg_watch =
@@ -1444,10 +1427,8 @@ let optimizing_objective _env _uf _o = None
 
 let new_terms env = env.new_terms
 
-(* [(is_finite x /\ lo <= i < hi) -> term = int2bv n i] for [term =
-   fp.to_ubv/sbv n mode x], with [i = to_int mode x] and [[lo, hi)] the integers
-   of [n] bits. Outside of this domain, SMT-LIB leaves the result unspecified,
-   and [term] is left uninterpreted. *)
+(* [is_finite x /\ lo <= i < hi -> term = int2bv n i], for [term = to_bv n mode
+   x] and [i = to_int mode x]. Unspecified elsewhere. *)
 let to_bv_definition term ~signed n =
   match E.term_view term with
   | { E.xs = [_; _; mode; x]; _ } -> (
@@ -1464,8 +1445,7 @@ let to_bv_definition term ~signed n =
     | _ -> assert false)
   | _ -> assert false
 
-(* Lemmas defining [term]: [is_normal] / [is_subnormal], and [fp.to_ubv] /
-   [fp.to_sbv] where they are specified (see [to_bv_definition]). *)
+(* Lemmas defining [term]. *)
 let definitions term =
   match normal_pred term, conv_kind term with
   | Some p, _ -> "fpa_normal_definition", [normal_definition term p]
@@ -1473,10 +1453,9 @@ let definitions term =
     "fpa_to_bv_definition", [to_bv_definition term ~signed n]
   | None, _ -> "fpa_to_bv_definition", []
 
-(* Instantiates the definitions of [defs], handed to the SAT solver, which
-   decides their guards. They are sent again at each round: Tableaux drops the
-   instances that contain a disjunction in some rounds, and CDCL drops the
-   theory state updated here (see [satml_frontend.ml]). *)
+(* Sends the lemmas of [defs] to the SAT solver, at each round: Tableaux drops
+   some instances with disjunctions, and CDCL drops this state (see
+   [satml_frontend.ml]). *)
 let instantiate ~do_syntactic_matching:_ _ env _ selector =
   if not (Options.get_smt_lib_fpa ())
   then env, []
