@@ -544,19 +544,15 @@ let bv_width bv =
 (* Bits of the magnitude of the integer of [bv]. *)
 let bv_int_bits ~signed bv = if signed then bv_width bv - 1 else bv_width bv
 
-(* [Some (bv, signed)] if [i] is the integer of [bv] and is exact in [(eb,
-   sb)]. *)
-let exact_bv_int eb sb i =
+(* [Some (bv, signed, exact)] if [i] is the integer of [bv] and its conversion
+   to [(eb, sb)] cannot overflow; [exact] if it is not rounded. *)
+let bv_int_conversion eb sb i =
   match E.FP.of_bv_int_view i with
   | Some (bv, signed) ->
     let bits = bv_int_bits ~signed bv in
-    if
-      bits <= sb
-      && Q.compare
-           (Q.from_z (Z.shift_left Z.one bits))
-           (Fp_value.max_finite_q eb sb)
-         <= 0
-    then Some (bv, signed)
+    let bound = Q.from_z (Z.shift_left Z.one bits) in
+    if Q.compare bound (Fp_value.max_finite_q eb sb) <= 0
+    then Some (bv, signed, bits <= sb)
     else None
   | None -> None
 
@@ -566,31 +562,22 @@ let exact_bv_int eb sb i =
 let of_bv_int_facts term =
   match E.term_view term with
   | { E.xs = [eb_t; sb_t; mode; i]; ty = Ty.Tfloat (eb, sb); _ } -> (
-    match E.FP.of_bv_int_view i with
-    | Some (bv, signed) ->
-      let bits = bv_int_bits ~signed bv in
-      let bound = Q.from_z (Z.shift_left Z.one bits) in
-      if Q.compare bound (Fp_value.max_finite_q eb sb) <= 0
-      then
-        let pred mk b =
-          if b then mk ~eb ~sb term else E.neg (mk ~eb ~sb term)
-        in
-        let value =
-          if bits <= sb
-          then real_of_int i
-          else
-            E.mk_term (Sy.Op FloatEbSb)
-              [eb_t; sb_t; mode; real_of_int i]
-              Ty.Treal
-        in
-        let facts =
-          [ pred E.FP.is_finite true;
-            pred E.FP.is_nan false;
-            pred E.FP.is_infinite false;
-            E.mk_eq ~iff:false (E.FP.to_real ~eb ~sb term) value ]
-        in
-        if signed then facts else pred E.FP.is_positive true :: facts
-      else []
+    match bv_int_conversion eb sb i with
+    | Some (_, signed, exact) ->
+      let pred mk b = if b then mk ~eb ~sb term else E.neg (mk ~eb ~sb term) in
+      let value =
+        if exact
+        then real_of_int i
+        else
+          E.mk_term (Sy.Op FloatEbSb) [eb_t; sb_t; mode; real_of_int i] Ty.Treal
+      in
+      let facts =
+        [ pred E.FP.is_finite true;
+          pred E.FP.is_nan false;
+          pred E.FP.is_infinite false;
+          E.mk_eq ~iff:false (E.FP.to_real ~eb ~sb term) value ]
+      in
+      if signed then facts else pred E.FP.is_positive true :: facts
     | None -> [])
   | _ -> []
 
@@ -684,7 +671,10 @@ module Conv_watch = struct
     match e, m with
     | Some (ze, ex_e), _ when Z.equal ze (all_ones eb) -> (
       (* NaN or infinite, infinite iff [m = 0]. *)
-      [pred ex_e E.FP.is_zero false; pred ex_e E.FP.is_finite false]
+      [ pred ex_e E.FP.is_zero false;
+        pred ex_e E.FP.is_finite false;
+        pred ex_e E.FP.is_normal false;
+        pred ex_e E.FP.is_subnormal false ]
       @
       match m with
       | Some (zm, ex_m) ->
@@ -694,16 +684,22 @@ module Conv_watch = struct
         :: (if zero_m then [pred ex E.FP.is_infinite true] else [])
       | None -> [])
     | Some (ze, ex_e), _ -> (
-      (* Finite, zero iff [e = m = 0]. *)
+      (* Finite: normal iff [e <> 0], else zero iff [m = 0], subnormal
+         otherwise. *)
       [ pred ex_e E.FP.is_nan false;
         pred ex_e E.FP.is_infinite false;
         pred ex_e E.FP.is_finite true ]
       @
       match m with
-      | _ when not (Z.equal ze Z.zero) -> [pred ex_e E.FP.is_zero false]
+      | _ when not (Z.equal ze Z.zero) ->
+        [pred ex_e E.FP.is_zero false; pred ex_e E.FP.is_normal true]
       | Some (zm, ex_m) ->
-        [pred (Ex.union ex_e ex_m) E.FP.is_zero (Z.equal zm Z.zero)]
-      | None -> [])
+        let ex = Ex.union ex_e ex_m in
+        let zero_m = Z.equal zm Z.zero in
+        [ pred ex_e E.FP.is_normal false;
+          pred ex E.FP.is_zero zero_m;
+          pred ex E.FP.is_subnormal (not zero_m) ]
+      | None -> [pred ex_e E.FP.is_normal false])
     | None, _ -> []
 
   (* Explanation of not NaN, if known. *)
@@ -828,9 +824,14 @@ module Conv_watch = struct
       let eb1, sb1 = float_format x in
       (* Widening is exact. *)
       let exact = eb1 <= eb2 && sb1 <= sb2 in
-      (* Value, once [x] (and [mode] if [x] is finite) is known. *)
+      (* Value, once [x] (and [mode] if [x] is finite and narrowed) is known. *)
       let eval =
-        let m, ex_m = known_mode rep_mode in
+        let m, ex_m =
+          (* Widening is exact in any mode. *)
+          if exact
+          then Some Dolmen.Std.Builtin.Float.RoundNearestTiesToEven, Ex.empty
+          else known_mode rep_mode
+        in
         match get_fp_value rep_x with
         | Some (v, ex_x) -> (
           match Fp_value.convert eb2 sb2 m v with
@@ -940,8 +941,8 @@ module Conv_watch = struct
               { E.xs = [_; _; _; i]; ty = Ty.Tfloat (eb, sb); _ } )
             when X.equal r_x r_i -> (
             let ex_x = snd rep_x in
-            match exact_bv_int eb sb i with
-            | Some (bv, signed') ->
+            match bv_int_conversion eb sb i with
+            | Some (bv, signed', true) ->
               let n' = bv_width bv in
               let lo', hi' = bv_range ~signed:signed' n' in
               if Z.compare lo lo' <= 0 && Z.compare hi' hi <= 0
@@ -954,7 +955,7 @@ module Conv_watch = struct
                 lit_fact (Ex.union ex_x ex_i) (E.mk_eq ~iff:false term ext)
                 :: acc
               else acc
-            | None -> acc)
+            | Some (_, _, false) | None -> acc)
           | _ -> acc)
         (watchers r_x t) []
     in
@@ -1473,7 +1474,7 @@ let definitions term =
   | Some p, _ -> "fpa_normal_definition", [normal_definition term p]
   | None, Some (To_bv (signed, n)) ->
     "fpa_to_bv_definition", [to_bv_definition term ~signed n]
-  | None, _ -> "fpa_to_bv_definition", []
+  | None, _ -> assert false
 
 (* Sends the lemmas of [defs] to the SAT solver, at each round: Tableaux drops
    some instances with disjunctions, and CDCL drops this state (see
