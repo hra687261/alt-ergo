@@ -852,14 +852,36 @@ module Conv_watch = struct
           [pred_fact ex (Domain.to_expr p) ~eb:eb1 ~sb:sb1 x b]
         | _ -> []
       in
-      (* [x] and [term] finite: [to_real x], rounded unless exact. *)
+      (* Explanation that a finite [term] did not overflow: a narrowing overflow
+         gives an infinity only when rounding away from zero, otherwise the
+         largest finite value. *)
+      let no_overflow =
+        let module RM = Dolmen.Std.Builtin.Float in
+        let if_sign p ex_m =
+          match Domains.status domains rep_x p with
+          | Some (true, ex) -> Some (Ex.union ex_m ex)
+          | _ -> None
+        in
+        match exact, known_mode rep_mode with
+        | true, _ -> Some Ex.empty
+        | _, (Some (RM.RoundNearestTiesToEven | RoundNearestTiesToAway), ex_m)
+          ->
+          Some ex_m
+        | _, (Some RoundTowardPositive, ex_m) -> if_sign Positive ex_m
+        | _, (Some RoundTowardNegative, ex_m) -> if_sign Negative ex_m
+        | _, ((Some RoundTowardZero | None), _) -> None
+      in
+      (* [x] and [term] finite, no overflow: [to_real x], rounded unless
+         exact. *)
       let real =
         match
           ( Domains.status domains rep_x Nan,
             Domains.status domains rep_x Infinite,
-            Domains.status domains rep_r Infinite )
+            Domains.status domains rep_r Infinite,
+            no_overflow )
         with
-        | Some (false, ex1), Some (false, ex2), Some (false, ex3) ->
+        | Some (false, ex1), Some (false, ex2), Some (false, ex3), Some ex4 ->
+          let ex3 = Ex.union ex3 ex4 in
           let real_x = E.FP.to_real ~eb:eb1 ~sb:sb1 x in
           let value =
             if exact

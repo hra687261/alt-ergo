@@ -777,3 +777,30 @@ Not every value fits in 8 bits (unspecified result), so this must not be unsat.
   > EOF
   
   unknown
+
+A narrowing conversion that rounds toward zero overflows to the largest finite
+value, not to an infinity, so these must not be unsat.
+
+  $ alt-ergo --steps-bound 1000 -o smtlib2 --enable-theory smt.float 2>/dev/null <<EOF
+  > (set-logic ALL)
+  > (declare-const x Float64)
+  > (declare-const y Float32)
+  > (assert (= x (fp #b0 #b11111111110 #x0000000000000)))
+  > (assert (= y ((_ to_fp 8 24) RTZ x)))
+  > (assert (= y (fp #b0 #b11111110 #b11111111111111111111111)))
+  > (check-sat)
+  > EOF
+  
+  unknown
+
+  $ alt-ergo --steps-bound 1000 -o smtlib2 --enable-theory smt.float 2>/dev/null <<EOF
+  > (set-logic ALL)
+  > (declare-const x Float64)
+  > (assert (fp.isNegative x))
+  > (assert (not (fp.isInfinite x)))
+  > (assert (fp.lt x (fp #b1 #b11110000000 #x0000000000000)))
+  > (assert (not (fp.isInfinite ((_ to_fp 8 24) RTP x))))
+  > (check-sat)
+  > EOF
+  
+  unknown
